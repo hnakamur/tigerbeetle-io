@@ -6,10 +6,12 @@ const IO_Uring = linux.IO_Uring;
 const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
 
+const builtin = @import("builtin");
+
 const FIFO = @import("fifo.zig").FIFO;
 const IO_Darwin = @import("io_darwin.zig").IO;
 
-pub const IO = switch (std.Target.current.os.tag) {
+pub const IO = switch (builtin.target.os.tag) {
     .linux => IO_Linux,
     .macos, .tvos, .watchos, .ios => IO_Darwin,
     else => @compileError("IO is not supported for platform"),
@@ -64,9 +66,9 @@ const IO_Linux = struct {
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
         var current_ts: os.timespec = undefined;
-        os.clock_gettime(os.CLOCK_MONOTONIC, &current_ts) catch unreachable;
+        os.clock_gettime(os.CLOCK.MONOTONIC, &current_ts) catch unreachable;
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
-        const timeout_ts: os.__kernel_timespec = .{
+        const timeout_ts: linux.kernel_timespec = .{
             .tv_sec = current_ts.tv_sec,
             .tv_nsec = current_ts.tv_nsec + nanoseconds,
         };
@@ -79,7 +81,7 @@ const IO_Linux = struct {
                 break :blk self.ring.get_sqe() catch unreachable;
             };
             // Submit an absolute timeout that will be canceled if any other SQE completes first:
-            linux.io_uring_prep_timeout(timeout_sqe, &timeout_ts, 1, os.IORING_TIMEOUT_ABS);
+            linux.io_uring_prep_timeout(timeout_sqe, &timeout_ts, 1, linux.IORING_TIMEOUT_ABS);
             timeout_sqe.user_data = 0;
             timeouts += 1;
             // The amount of time this call will block is bounded by the timeout we just submitted:
@@ -131,7 +133,7 @@ const IO_Linux = struct {
                     // it was completed due to the completion of an event, in which case `cqe.res`
                     // would be 0. It is possible for multiple timeout operations to complete at the
                     // same time if the nanoseconds value passed to `run_for_ns()` is very short.
-                    if (-cqe.res == os.ETIME) etime.* = true;
+                    if (@intToEnum(os.E, -cqe.res) == .TIME) etime.* = true;
                     continue;
                 }
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
@@ -245,215 +247,279 @@ const IO_Linux = struct {
         fn complete(completion: *Completion) void {
             switch (completion.operation) {
                 .accept => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECONNABORTED => error.ConnectionAborted,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => error.SocketNotListening,
-                        os.EMFILE => error.ProcessFdQuotaExceeded,
-                        os.ENFILE => error.SystemFdQuotaExceeded,
-                        os.ENOBUFS => error.SystemResources,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.EOPNOTSUPP => error.OperationNotSupported,
-                        os.EPERM => error.PermissionDenied,
-                        os.EPROTO => error.ProtocolFailure,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else @intCast(os.socket_t, completion.result);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CONNABORTED => error.ConnectionAborted,
+                                .FAULT => unreachable,
+                                .INVAL => error.SocketNotListening,
+                                .MFILE => error.ProcessFdQuotaExceeded,
+                                .NFILE => error.SystemFdQuotaExceeded,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .PERM => error.PermissionDenied,
+                                .PROTO => error.ProtocolFailure,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(os.socket_t, completion.result);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .close => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.EDQUOT => error.DiskQuota,
-                        os.EIO => error.InputOutput,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else assert(completion.result == 0);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
+                                .BADF => error.FileDescriptorInvalid,
+                                .DQUOT => error.DiskQuota,
+                                .IO => error.InputOutput,
+                                .NOSPC => error.NoSpaceLeft,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .connect => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EACCES => error.AccessDenied,
-                        os.EADDRINUSE => error.AddressInUse,
-                        os.EADDRNOTAVAIL => error.AddressNotAvailable,
-                        os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
-                        os.EAGAIN, os.EINPROGRESS => error.WouldBlock,
-                        os.EALREADY => error.OpenAlreadyInProgress,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECONNREFUSED => error.ConnectionRefused,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        os.EFAULT => unreachable,
-                        os.EISCONN => error.AlreadyConnected,
-                        os.ENETUNREACH => error.NetworkUnreachable,
-                        os.ENOENT => error.FileNotFound,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.EPERM => error.PermissionDenied,
-                        os.EPROTOTYPE => error.ProtocolNotSupported,
-                        os.ETIMEDOUT => error.ConnectionTimedOut,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else assert(completion.result == 0);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .ACCES => error.AccessDenied,
+                                .ADDRINUSE => error.AddressInUse,
+                                .ADDRNOTAVAIL => error.AddressNotAvailable,
+                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                                .AGAIN, .INPROGRESS => error.WouldBlock,
+                                .ALREADY => error.OpenAlreadyInProgress,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .FAULT => unreachable,
+                                .ISCONN => error.AlreadyConnected,
+                                .NETUNREACH => error.NetworkUnreachable,
+                                .NOENT => error.FileNotFound,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .PERM => error.PermissionDenied,
+                                .PROTOTYPE => error.ProtocolNotSupported,
+                                .TIMEDOUT => error.ConnectionTimedOut,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .fsync => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.EDQUOT => error.DiskQuota,
-                        os.EINVAL => error.ArgumentsInvalid,
-                        os.EIO => error.InputOutput,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        os.EROFS => error.ReadOnlyFileSystem,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else assert(completion.result == 0);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .BADF => error.FileDescriptorInvalid,
+                                .DQUOT => error.DiskQuota,
+                                .INVAL => error.ArgumentsInvalid,
+                                .IO => error.InputOutput,
+                                .NOSPC => error.NoSpaceLeft,
+                                .ROFS => error.ReadOnlyFileSystem,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            assert(completion.result == 0);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .openat => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EACCES => error.AccessDenied,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.EBUSY => error.DeviceBusy,
-                        os.EEXIST => error.PathAlreadyExists,
-                        os.EFAULT => unreachable,
-                        os.EFBIG => error.FileTooBig,
-                        os.EINVAL => error.ArgumentsInvalid,
-                        os.EISDIR => error.IsDir,
-                        os.ELOOP => error.SymLinkLoop,
-                        os.EMFILE => error.ProcessFdQuotaExceeded,
-                        os.ENAMETOOLONG => error.NameTooLong,
-                        os.ENFILE => error.SystemFdQuotaExceeded,
-                        os.ENODEV => error.NoDevice,
-                        os.ENOENT => error.FileNotFound,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        os.ENOTDIR => error.NotDir,
-                        os.EOPNOTSUPP => error.FileLocksNotSupported,
-                        os.EOVERFLOW => error.FileTooBig,
-                        os.EPERM => error.AccessDenied,
-                        os.EWOULDBLOCK => error.WouldBlock,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else @intCast(os.fd_t, completion.result);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .ACCES => error.AccessDenied,
+                                .BADF => error.FileDescriptorInvalid,
+                                .BUSY => error.DeviceBusy,
+                                .EXIST => error.PathAlreadyExists,
+                                .FAULT => unreachable,
+                                .FBIG => error.FileTooBig,
+                                .INVAL => error.ArgumentsInvalid,
+                                .ISDIR => error.IsDir,
+                                .LOOP => error.SymLinkLoop,
+                                .MFILE => error.ProcessFdQuotaExceeded,
+                                .NAMETOOLONG => error.NameTooLong,
+                                .NFILE => error.SystemFdQuotaExceeded,
+                                .NODEV => error.NoDevice,
+                                .NOENT => error.FileNotFound,
+                                .NOMEM => error.SystemResources,
+                                .NOSPC => error.NoSpaceLeft,
+                                .NOTDIR => error.NotDir,
+                                .OPNOTSUPP => error.FileLocksNotSupported,
+                                .OVERFLOW => error.FileTooBig,
+                                .PERM => error.AccessDenied,
+                                .AGAIN => error.WouldBlock,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(os.fd_t, completion.result);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .read => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.NotOpenForReading,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => error.Alignment,
-                        os.EIO => error.InputOutput,
-                        os.EISDIR => error.IsDir,
-                        os.ENOBUFS => error.SystemResources,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENXIO => error.Unseekable,
-                        os.EOVERFLOW => error.Unseekable,
-                        os.ESPIPE => error.Unseekable,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else @intCast(usize, completion.result);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.NotOpenForReading,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .FAULT => unreachable,
+                                .INVAL => error.Alignment,
+                                .IO => error.InputOutput,
+                                .ISDIR => error.IsDir,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NXIO => error.Unseekable,
+                                .OVERFLOW => error.Unseekable,
+                                .SPIPE => error.Unseekable,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(usize, completion.result);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .recv => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECONNREFUSED => error.ConnectionRefused,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => unreachable,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOTCONN => error.SocketNotConnected,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else @intCast(usize, completion.result);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CONNREFUSED => error.ConnectionRefused,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(usize, completion.result);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .send => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EACCES => error.AccessDenied,
-                        os.EAGAIN => error.WouldBlock,
-                        os.EALREADY => error.FastOpenAlreadyInProgress,
-                        os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        os.EDESTADDRREQ => unreachable,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => unreachable,
-                        os.EISCONN => unreachable,
-                        os.EMSGSIZE => error.MessageTooBig,
-                        os.ENOBUFS => error.SystemResources,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOTCONN => error.SocketNotConnected,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.EOPNOTSUPP => error.OperationNotSupported,
-                        os.EPIPE => error.BrokenPipe,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else @intCast(usize, completion.result);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .ACCES => error.AccessDenied,
+                                .AGAIN => error.WouldBlock,
+                                .ALREADY => error.FastOpenAlreadyInProgress,
+                                .AFNOSUPPORT => error.AddressFamilyNotSupported,
+                                .BADF => error.FileDescriptorInvalid,
+                                .CONNRESET => error.ConnectionResetByPeer,
+                                .DESTADDRREQ => unreachable,
+                                .FAULT => unreachable,
+                                .INVAL => unreachable,
+                                .ISCONN => unreachable,
+                                .MSGSIZE => error.MessageTooBig,
+                                .NOBUFS => error.SystemResources,
+                                .NOMEM => error.SystemResources,
+                                .NOTCONN => error.SocketNotConnected,
+                                .NOTSOCK => error.FileDescriptorNotASocket,
+                                .OPNOTSUPP => error.OperationNotSupported,
+                                .PIPE => error.BrokenPipe,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(usize, completion.result);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .timeout => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    assert(completion.result < 0);
+                    const result = switch (@intToEnum(os.E, -completion.result)) {
+                        .INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.ECANCELED => error.Canceled,
-                        os.ETIME => {}, // A success.
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else unreachable;
+                        .CANCELED => error.Canceled,
+                        .TIME => {}, // A success.
+                        else => |errno| os.unexpectedErrno(errno),
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
                 .write => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
-                            completion.io.enqueue(completion);
-                            return;
-                        },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.NotOpenForWriting,
-                        os.EDESTADDRREQ => error.NotConnected,
-                        os.EDQUOT => error.DiskQuota,
-                        os.EFAULT => unreachable,
-                        os.EFBIG => error.FileTooBig,
-                        os.EINVAL => error.Alignment,
-                        os.EIO => error.InputOutput,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        os.ENXIO => error.Unseekable,
-                        os.EOVERFLOW => error.Unseekable,
-                        os.EPERM => error.AccessDenied,
-                        os.EPIPE => error.BrokenPipe,
-                        os.ESPIPE => error.Unseekable,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
-                    } else @intCast(usize, completion.result);
+                    const result = blk: {
+                        if (completion.result < 0) {
+                            const err = switch (@intToEnum(os.E, -completion.result)) {
+                                .INTR => {
+                                    completion.io.enqueue(completion);
+                                    return;
+                                },
+                                .AGAIN => error.WouldBlock,
+                                .BADF => error.NotOpenForWriting,
+                                .DESTADDRREQ => error.NotConnected,
+                                .DQUOT => error.DiskQuota,
+                                .FAULT => unreachable,
+                                .FBIG => error.FileTooBig,
+                                .INVAL => error.Alignment,
+                                .IO => error.InputOutput,
+                                .NOSPC => error.NoSpaceLeft,
+                                .NXIO => error.Unseekable,
+                                .OVERFLOW => error.Unseekable,
+                                .PERM => error.AccessDenied,
+                                .PIPE => error.BrokenPipe,
+                                .SPIPE => error.Unseekable,
+                                else => |errno| os.unexpectedErrno(errno),
+                            };
+                            break :blk err;
+                        } else {
+                            break :blk @intCast(usize, completion.result);
+                        }
+                    };
                     completion.callback(completion.context, completion, &result);
                 },
             }
@@ -501,7 +567,7 @@ const IO_Linux = struct {
             flags: u32,
         },
         timeout: struct {
-            timespec: os.__kernel_timespec,
+            timespec: linux.kernel_timespec,
         },
         write: struct {
             fd: os.fd_t,
@@ -995,7 +1061,7 @@ pub fn buffer_limit(buffer_len: usize) usize {
     // stuffing the errno codes into the last `4096` values.
     // Darwin limits writes to `0x7fffffff` bytes, more than that returns `EINVAL`.
     // The corresponding POSIX limit is `std.math.maxInt(isize)`.
-    const limit = switch (std.Target.current.os.tag) {
+    const limit = switch (builtin.target.os.tag) {
         .linux => 0x7ffff000,
         .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
         else => std.math.maxInt(isize),
@@ -1060,6 +1126,7 @@ test "write/fsync/read" {
             completion: *IO.Completion,
             result: IO.WriteError!usize,
         ) void {
+            _ = completion;
             self.written = result catch @panic("write error");
             self.io.fsync(*Context, self, fsync_callback, completion, self.fd, 0);
         }
@@ -1069,6 +1136,7 @@ test "write/fsync/read" {
             completion: *IO.Completion,
             result: IO.FsyncError!void,
         ) void {
+            _ = completion;
             result catch @panic("fsync error");
             self.fsynced = true;
             self.io.read(*Context, self, read_callback, completion, self.fd, &self.read_buf, 10);
@@ -1079,6 +1147,7 @@ test "write/fsync/read" {
             completion: *IO.Completion,
             result: IO.ReadError!usize,
         ) void {
+            _ = completion;
             self.read = result catch @panic("read error");
             self.done = true;
         }
@@ -1123,6 +1192,7 @@ test "openat/close" {
             completion: *IO.Completion,
             result: IO.OpenatError!os.fd_t,
         ) void {
+            _ = completion;
             self.fd = result catch @panic("openat error");
             self.io.close(*Context, self, close_callback, completion, self.fd);
         }
@@ -1132,6 +1202,7 @@ test "openat/close" {
             completion: *IO.Completion,
             result: IO.CloseError!void,
         ) void {
+            _ = completion;
             result catch @panic("close error");
             self.done = true;
         }
@@ -1208,6 +1279,7 @@ test "accept/connect/send/receive" {
             completion: *IO.Completion,
             result: IO.ConnectError!void,
         ) void {
+            _ = completion;
             result catch @panic("connect error");
             self.io.send(
                 *Context,
@@ -1225,6 +1297,7 @@ test "accept/connect/send/receive" {
             completion: *IO.Completion,
             result: IO.SendError!usize,
         ) void {
+            _ = completion;
             self.sent = result catch @panic("send error");
         }
 
@@ -1233,6 +1306,7 @@ test "accept/connect/send/receive" {
             completion: *IO.Completion,
             result: IO.AcceptError!os.socket_t,
         ) void {
+            _ = completion;
             self.accepted_sock = result catch @panic("accept error");
             self.io.recv(
                 *Context,
@@ -1250,6 +1324,7 @@ test "accept/connect/send/receive" {
             completion: *IO.Completion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.received = result catch @panic("recv error");
             self.done = true;
         }
@@ -1302,6 +1377,7 @@ test "timeout" {
             completion: *IO.Completion,
             result: IO.TimeoutError!void,
         ) void {
+            _ = completion;
             result catch @panic("timeout error");
             if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
             self.count += 1;
@@ -1346,6 +1422,7 @@ test "submission queue full" {
             completion: *IO.Completion,
             result: IO.TimeoutError!void,
         ) void {
+            _ = completion;
             result catch @panic("timeout error");
             self.count += 1;
         }

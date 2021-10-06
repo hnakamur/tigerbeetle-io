@@ -14,6 +14,9 @@ pub const IO = struct {
     io_pending: FIFO(Completion) = .{},
 
     pub fn init(entries: u12, flags: u32) !IO {
+        // TODO: consider a more cross-platform init API
+        _ = entries;
+        _ = flags;
         const kq = try os.kqueue();
         assert(kq > -1);
         return IO{ .kq = kq };
@@ -36,19 +39,21 @@ pub const IO = struct {
     /// The `nanoseconds` argument is a u63 to allow coercion to the i64 used
     /// in the __kernel_timespec struct.
     pub fn run_for_ns(self: *IO, nanoseconds: u63) !void {
-        var timed_out = false;
-        var completion: Completion = undefined;
         const on_timeout = struct {
             fn callback(
                 timed_out_ptr: *bool,
-                _completion: *Completion,
-                _result: TimeoutError!void,
+                completion: *Completion,
+                result: TimeoutError!void,
             ) void {
+                _ = completion;
+                _ = result;
                 timed_out_ptr.* = true;
             }
         }.callback;
 
         // Submit a timeout which sets the timed_out value to true to terminate the loop below.
+        var timed_out = false;
+        var completion: Completion = undefined;
         self.timeout(
             *bool,
             &timed_out,
@@ -72,7 +77,7 @@ pub const IO = struct {
         // (they will be submitted through kevent).
         // Timeouts are expired here and possibly pushed to the completed queue.
         const next_timeout = self.flush_timeouts();
-        const change_events = self.flush_io(&events, &io_pending);
+        const change_events = flush_io(&events, &io_pending);
 
         // Only call kevent() if we need to submit io events or if we need to wait for completions.
         if (change_events > 0 or self.completed.peek() == null) {
@@ -116,7 +121,7 @@ pub const IO = struct {
         }
     }
 
-    fn flush_io(self: *IO, events: []os.Kevent, io_pending_top: *?*Completion) usize {
+    fn flush_io(events: []os.Kevent, io_pending_top: *?*Completion) usize {
         for (events) |*event, flushed| {
             const completion = io_pending_top.* orelse return flushed;
             io_pending_top.* = completion.next;
