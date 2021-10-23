@@ -72,6 +72,10 @@ pub fn main() anyerror!void {
             result: IO.RecvError!usize,
         ) void {
             self.received = result catch @panic("recv error");
+            if (self.received == 0) {
+                self.done = true;
+                return;
+            }
             self.io.send(
                 *Context,
                 self,
@@ -85,11 +89,19 @@ pub fn main() anyerror!void {
 
         fn send_callback(
             self: *Context,
-            _: *IO.Completion,
+            completion: *IO.Completion,
             result: IO.SendError!usize,
         ) void {
             self.sent = result catch @panic("send error");
-            self.done = true;
+            self.io.recv(
+                *Context,
+                self,
+                recv_callback,
+                completion,
+                self.accepted_sock,
+                &self.recv_buf,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+            );
         }
     }.run_test();
 }
