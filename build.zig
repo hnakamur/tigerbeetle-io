@@ -19,6 +19,7 @@ pub fn build(b: *std.build.Builder) void {
     const example_step = b.step("examples", "Build examples");
     inline for (.{
         "hello",
+        "tcp_echo_server",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
         example.addPackagePath("tigerbeetle-io", "src/io.zig");
