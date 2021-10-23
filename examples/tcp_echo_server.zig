@@ -4,19 +4,103 @@ const net = std.net;
 const os = std.os;
 const IO = @import("tigerbeetle-io").IO;
 
+const ClientHandler = struct {
+    io: *IO,
+    sock: os.socket_t,
+    recv_buf: []u8,
+    allocator: *mem.Allocator,
+    completion: IO.Completion,
+
+    fn init(allocator: *mem.Allocator, io: *IO, sock: os.socket_t) !*ClientHandler {
+        var buf = try allocator.alloc(u8, 1024);
+        var self = try allocator.create(ClientHandler);
+        self.* = ClientHandler{
+            .io = io,
+            .sock = sock,
+            .recv_buf = buf,
+            .allocator = allocator,
+            .completion = undefined,
+        };
+        return self;
+    }
+
+    fn deinit(self: *ClientHandler) !void {
+        self.allocator.free(self.recv_buf);
+        self.allocator.destroy(self);
+    }
+
+    fn start(self: *ClientHandler) !void {
+        self.io.recv(
+            *ClientHandler,
+            self,
+            recv_callback,
+            &self.completion,
+            self.sock,
+            self.recv_buf,
+            if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+        );
+    }
+
+    fn recv_callback(
+        self: *ClientHandler,
+        completion: *IO.Completion,
+        result: IO.RecvError!usize,
+    ) void {
+        const received = result catch @panic("recv error");
+        if (received == 0) {
+            self.io.close(
+                *ClientHandler,
+                self,
+                close_callback,
+                completion,
+                self.sock,
+            );
+            return;
+        }
+        self.io.send(
+            *ClientHandler,
+            self,
+            send_callback,
+            completion,
+            self.sock,
+            self.recv_buf[0..received],
+            if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+        );
+    }
+
+    fn send_callback(
+        self: *ClientHandler,
+        completion: *IO.Completion,
+        result: IO.SendError!usize,
+    ) void {
+        _ = result catch @panic("send error");
+        self.io.recv(
+            *ClientHandler,
+            self,
+            recv_callback,
+            completion,
+            self.sock,
+            self.recv_buf,
+            if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+        );
+    }
+
+    fn close_callback(
+        self: *ClientHandler,
+        completion: *IO.Completion,
+        result: IO.CloseError!void,
+    ) void {
+        _ = result catch @panic("close error");
+        self.deinit() catch @panic("ClientHandler deinit error");
+    }
+};
+
 const Server = struct {
     io: IO,
-    done: bool = false,
     server: os.socket_t,
+    allocator: *mem.Allocator,
 
-    accepted_sock: os.socket_t = undefined,
-
-    recv_buf: [1024]u8 = [_]u8{0} ** 1024,
-
-    sent: usize = 0,
-    received: usize = 0,
-
-    fn init(address: std.net.Address) !Server {
+    fn init(allocator: *mem.Allocator, address: std.net.Address) !Server {
         const kernel_backlog = 1;
         const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
 
@@ -32,6 +116,7 @@ const Server = struct {
         var self: Server = .{
             .io = try IO.init(32, 0),
             .server = server,
+            .allocator = allocator,
         };
 
         return self;
@@ -45,7 +130,7 @@ const Server = struct {
     pub fn run(self: *Server) !void {
         var server_completion: IO.Completion = undefined;
         self.io.accept(*Server, self, accept_callback, &server_completion, self.server, 0);
-        while (!self.done) try self.io.tick();
+        while (true) try self.io.tick();
     }
 
     fn accept_callback(
@@ -53,60 +138,17 @@ const Server = struct {
         completion: *IO.Completion,
         result: IO.AcceptError!os.socket_t,
     ) void {
-        self.accepted_sock = result catch @panic("accept error");
-        self.io.recv(
-            *Server,
-            self,
-            recv_callback,
-            completion,
-            self.accepted_sock,
-            &self.recv_buf,
-            if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
-        );
-    }
-
-    fn recv_callback(
-        self: *Server,
-        completion: *IO.Completion,
-        result: IO.RecvError!usize,
-    ) void {
-        self.received = result catch @panic("recv error");
-        if (self.received == 0) {
-            self.done = true;
-            return;
-        }
-        self.io.send(
-            *Server,
-            self,
-            send_callback,
-            completion,
-            self.accepted_sock,
-            self.recv_buf[0..self.received],
-            if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
-        );
-    }
-
-    fn send_callback(
-        self: *Server,
-        completion: *IO.Completion,
-        result: IO.SendError!usize,
-    ) void {
-        self.sent = result catch @panic("send error");
-        self.io.recv(
-            *Server,
-            self,
-            recv_callback,
-            completion,
-            self.accepted_sock,
-            &self.recv_buf,
-            if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
-        );
+        const accepted_sock = result catch @panic("accept error");
+        var handler = ClientHandler.init(self.allocator, &self.io, accepted_sock) catch @panic("handler create error");
+        handler.start() catch @panic("handler");
+        self.io.accept(*Server, self, accept_callback, completion, self.server, 0);
     }
 };
 
 pub fn main() anyerror!void {
+    const allocator = std.heap.page_allocator;
     const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
-    var server = try Server.init(address);
+    var server = try Server.init(allocator, address);
     defer server.deinit();
     try server.run();
 }
