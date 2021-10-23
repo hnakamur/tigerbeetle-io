@@ -1,4 +1,5 @@
 const std = @import("std");
+const pkgs = @import("deps.zig").pkgs;
 
 pub fn build(b: *std.build.Builder) void {
     // Standard release options allow the person running `zig build` to select
@@ -6,7 +7,7 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
-    const lib = b.addStaticLibrary("tigerbeetle-io", "src/io.zig");
+    const lib = b.addStaticLibrary("tigerbeetle-io", "src/main.zig");
     lib.setBuildMode(mode);
     lib.install();
 
@@ -19,12 +20,14 @@ pub fn build(b: *std.build.Builder) void {
     const example_step = b.step("examples", "Build examples");
     inline for (.{
         "hello",
+        "http_server",
         "tcp_echo_server",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
-        example.addPackagePath("tigerbeetle-io", "src/io.zig");
+        example.addPackagePath("tigerbeetle-io", "src/main.zig");
         example.setBuildMode(mode);
         example.setTarget(target);
+        pkgs.addAllTo(example);
         example.install();
         example_step.dependOn(&example.step);
     }

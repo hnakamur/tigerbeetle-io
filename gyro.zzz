@@ -1,0 +1,7 @@
+deps:
+  datetime:
+    src:
+      github:
+        user: frmdstryr
+        repo: zig-datetime
+        ref: master
