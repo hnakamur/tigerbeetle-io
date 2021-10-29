@@ -6,7 +6,7 @@ pub fn build(b: *std.build.Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
-    const lib = b.addStaticLibrary("tigerbeetle-io", "src/io.zig");
+    const lib = b.addStaticLibrary("tigerbeetle-io", "src/main.zig");
     lib.setBuildMode(mode);
     lib.install();
 
