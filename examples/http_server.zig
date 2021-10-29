@@ -69,7 +69,7 @@ const ClientHandler = struct {
         if (http.Request.parseBuf(self.recv_buf[0..received])) |req| {
             self.request = req;
             self.response = http.Response{
-                        .version = .Http11,
+                .version = .Http11,
                 .status_code = 200,
                 .status_text = "OK",
                 .body = "Hello from my HTTP server\n",
