@@ -12,11 +12,6 @@ const Client = struct {
     send_buf: []u8,
     recv_buf: []u8,
     allocator: *mem.Allocator,
-    frame: anyframe = undefined,
-    connect_result: IO.ConnectError!void = undefined,
-    send_result: IO.SendError!usize = undefined,
-    recv_result: IO.RecvError!usize = undefined,
-    close_result: IO.CloseError!void = undefined,
     done: bool = false,
 
     fn init(allocator: *mem.Allocator, address: std.net.Address) !Client {
@@ -41,18 +36,18 @@ const Client = struct {
     }
 
     pub fn start(self: *Client) !void {
-        try self.connect(self.sock, self.address);
+        try connect(&self.io, self.sock, self.address);
 
         var fbs = std.io.fixedBufferStream(self.send_buf);
         var w = fbs.writer();
         std.fmt.format(w, "Hello from client!\n", .{}) catch unreachable;
-        const sent = try self.send(self.sock, fbs.getWritten());
+        const sent = try send(&self.io, self.sock, fbs.getWritten());
         std.debug.print("Sent:     {s}", .{self.send_buf[0..sent]});
 
-        const received = try self.recv(self.sock, self.recv_buf);
+        const received = try recv(&self.io, self.sock, self.recv_buf);
         std.debug.print("Received: {s}", .{self.recv_buf[0..received]});
 
-        try self.close(self.sock);
+        try close(&self.io, self.sock);
         self.done = true;
     }
 
@@ -60,94 +55,114 @@ const Client = struct {
         while (!self.done) try self.io.tick();
     }
 
-    fn connect(self: *Client, sock: os.socket_t, address: std.net.Address) IO.ConnectError!void {
+    const ConnectContext = struct {
+        frame: anyframe = undefined,
+        result: IO.ConnectError!void = undefined,
+    };
+    fn connect(io: *IO, sock: os.socket_t, address: std.net.Address) IO.ConnectError!void {
+        var ctx: ConnectContext = undefined;
         var completion: IO.Completion = undefined;
-        self.io.connect(*Client, self, connectCallback, &completion, sock, address);
+        io.connect(*ConnectContext, &ctx, connectCallback, &completion, sock, address);
         suspend {
-            self.frame = @frame();
+            ctx.frame = @frame();
         }
-        return self.connect_result;
+        return ctx.result;
     }
     fn connectCallback(
-        self: *Client,
+        ctx: *ConnectContext,
         completion: *IO.Completion,
         result: IO.ConnectError!void,
     ) void {
-        self.connect_result = result;
-        resume self.frame;
+        ctx.result = result;
+        resume ctx.frame;
     }
 
-    fn send(self: *Client, sock: os.socket_t, buffer: []const u8) IO.SendError!usize {
+    const SendContext = struct {
+        frame: anyframe = undefined,
+        result: IO.SendError!usize = undefined,
+    };
+    fn send(io: *IO, sock: os.socket_t, buffer: []const u8) IO.SendError!usize {
+        var ctx: SendContext = undefined;
         var completion: IO.Completion = undefined;
-        self.io.send(
-            *Client,
-            self,
+        io.send(
+            *SendContext,
+            &ctx,
             sendCallback,
             &completion,
-            self.sock,
+            sock,
             buffer,
             if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
         );
         suspend {
-            self.frame = @frame();
+            ctx.frame = @frame();
         }
-        return self.send_result;
+        return ctx.result;
     }
     fn sendCallback(
-        self: *Client,
+        ctx: *SendContext,
         completion: *IO.Completion,
         result: IO.SendError!usize,
     ) void {
-        self.send_result = result;
-        resume self.frame;
+        ctx.result = result;
+        resume ctx.frame;
     }
 
-    fn recv(self: *Client, sock: os.socket_t, buffer: []u8) IO.RecvError!usize {
+    const RecvContext = struct {
+        frame: anyframe = undefined,
+        result: IO.RecvError!usize = undefined,
+    };
+    fn recv(io: *IO, sock: os.socket_t, buffer: []u8) IO.RecvError!usize {
+        var ctx: RecvContext = undefined;
         var completion: IO.Completion = undefined;
-        self.io.recv(
-            *Client,
-            self,
+        io.recv(
+            *RecvContext,
+            &ctx,
             recvCallback,
             &completion,
-            self.sock,
+            sock,
             buffer,
             if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
         );
         suspend {
-            self.frame = @frame();
+            ctx.frame = @frame();
         }
-        return self.recv_result;
+        return ctx.result;
     }
     fn recvCallback(
-        self: *Client,
+        ctx: *RecvContext,
         completion: *IO.Completion,
         result: IO.RecvError!usize,
     ) void {
-        self.recv_result = result;
-        resume self.frame;
+        ctx.result = result;
+        resume ctx.frame;
     }
 
-    fn close(self: *Client, sock: os.socket_t) IO.CloseError!void {
+    const CloseContext = struct {
+        frame: anyframe = undefined,
+        result: IO.CloseError!void = undefined,
+    };
+    fn close(io: *IO, sock: os.socket_t) IO.CloseError!void {
+        var ctx: CloseContext = undefined;
         var completion: IO.Completion = undefined;
-        self.io.close(
-            *Client,
-            self,
+        io.close(
+            *CloseContext,
+            &ctx,
             closeCallback,
             &completion,
-            self.sock,
+            sock,
         );
         suspend {
-            self.frame = @frame();
+            ctx.frame = @frame();
         }
-        return self.close_result;
+        return ctx.result;
     }
     fn closeCallback(
-        self: *Client,
+        ctx: *CloseContext,
         completion: *IO.Completion,
         result: IO.CloseError!void,
     ) void {
-        self.close_result = result;
-        resume self.frame;
+        ctx.result = result;
+        resume ctx.frame;
     }
 };
 
