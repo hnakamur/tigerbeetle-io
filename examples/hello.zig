@@ -28,7 +28,7 @@ pub fn main() anyerror!void {
             self.io.write(
                 *Context,
                 &self,
-                write_callback,
+                writeCallback,
                 &completion,
                 self.fd,
                 self.write_buf,
@@ -37,7 +37,7 @@ pub fn main() anyerror!void {
             while (!self.done) try self.io.tick();
         }
 
-        fn write_callback(
+        fn writeCallback(
             self: *Context,
             _: *IO.Completion,
             result: IO.WriteError!usize,

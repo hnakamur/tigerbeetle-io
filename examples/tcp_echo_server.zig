@@ -33,7 +33,7 @@ const ClientHandler = struct {
         self.io.recv(
             *ClientHandler,
             self,
-            recv_callback,
+            recvCallback,
             &self.completion,
             self.sock,
             self.recv_buf,
@@ -41,7 +41,7 @@ const ClientHandler = struct {
         );
     }
 
-    fn recv_callback(
+    fn recvCallback(
         self: *ClientHandler,
         completion: *IO.Completion,
         result: IO.RecvError!usize,
@@ -51,7 +51,7 @@ const ClientHandler = struct {
             self.io.close(
                 *ClientHandler,
                 self,
-                close_callback,
+                closeCallback,
                 completion,
                 self.sock,
             );
@@ -60,7 +60,7 @@ const ClientHandler = struct {
         self.io.send(
             *ClientHandler,
             self,
-            send_callback,
+            sendCallback,
             completion,
             self.sock,
             self.recv_buf[0..received],
@@ -68,7 +68,7 @@ const ClientHandler = struct {
         );
     }
 
-    fn send_callback(
+    fn sendCallback(
         self: *ClientHandler,
         completion: *IO.Completion,
         result: IO.SendError!usize,
@@ -77,7 +77,7 @@ const ClientHandler = struct {
         self.io.recv(
             *ClientHandler,
             self,
-            recv_callback,
+            recvCallback,
             completion,
             self.sock,
             self.recv_buf,
@@ -85,7 +85,7 @@ const ClientHandler = struct {
         );
     }
 
-    fn close_callback(
+    fn closeCallback(
         self: *ClientHandler,
         completion: *IO.Completion,
         result: IO.CloseError!void,
@@ -129,11 +129,11 @@ const Server = struct {
 
     pub fn run(self: *Server) !void {
         var server_completion: IO.Completion = undefined;
-        self.io.accept(*Server, self, accept_callback, &server_completion, self.server, 0);
+        self.io.accept(*Server, self, acceptCallback, &server_completion, self.server, 0);
         while (true) try self.io.tick();
     }
 
-    fn accept_callback(
+    fn acceptCallback(
         self: *Server,
         completion: *IO.Completion,
         result: IO.AcceptError!os.socket_t,
@@ -141,7 +141,7 @@ const Server = struct {
         const accepted_sock = result catch @panic("accept error");
         var handler = ClientHandler.init(self.allocator, &self.io, accepted_sock) catch @panic("handler create error");
         handler.start() catch @panic("handler");
-        self.io.accept(*Server, self, accept_callback, completion, self.server, 0);
+        self.io.accept(*Server, self, acceptCallback, completion, self.server, 0);
     }
 };
 
