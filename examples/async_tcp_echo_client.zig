@@ -5,6 +5,13 @@ const os = std.os;
 const IO = @import("tigerbeetle-io").IO;
 const http = @import("http");
 
+fn IoOpContext(comptime ResultType: type) type {
+    return struct {
+        frame: anyframe = undefined,
+        result: ResultType = undefined,
+    };
+}
+
 const Client = struct {
     io: IO,
     sock: os.socket_t,
@@ -55,10 +62,7 @@ const Client = struct {
         while (!self.done) try self.io.tick();
     }
 
-    const ConnectContext = struct {
-        frame: anyframe = undefined,
-        result: IO.ConnectError!void = undefined,
-    };
+    const ConnectContext = IoOpContext(IO.ConnectError!void);
     fn connect(io: *IO, sock: os.socket_t, address: std.net.Address) IO.ConnectError!void {
         var ctx: ConnectContext = undefined;
         var completion: IO.Completion = undefined;
@@ -77,10 +81,7 @@ const Client = struct {
         resume ctx.frame;
     }
 
-    const SendContext = struct {
-        frame: anyframe = undefined,
-        result: IO.SendError!usize = undefined,
-    };
+    const SendContext = IoOpContext(IO.SendError!usize);
     fn send(io: *IO, sock: os.socket_t, buffer: []const u8) IO.SendError!usize {
         var ctx: SendContext = undefined;
         var completion: IO.Completion = undefined;
@@ -107,10 +108,7 @@ const Client = struct {
         resume ctx.frame;
     }
 
-    const RecvContext = struct {
-        frame: anyframe = undefined,
-        result: IO.RecvError!usize = undefined,
-    };
+    const RecvContext = IoOpContext(IO.RecvError!usize);
     fn recv(io: *IO, sock: os.socket_t, buffer: []u8) IO.RecvError!usize {
         var ctx: RecvContext = undefined;
         var completion: IO.Completion = undefined;
@@ -137,10 +135,7 @@ const Client = struct {
         resume ctx.frame;
     }
 
-    const CloseContext = struct {
-        frame: anyframe = undefined,
-        result: IO.CloseError!void = undefined,
-    };
+    const CloseContext = IoOpContext(IO.CloseError!void);
     fn close(io: *IO, sock: os.socket_t) IO.CloseError!void {
         var ctx: CloseContext = undefined;
         var completion: IO.Completion = undefined;

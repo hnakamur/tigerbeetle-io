@@ -4,6 +4,13 @@ const net = std.net;
 const os = std.os;
 const IO = @import("tigerbeetle-io").IO;
 
+fn IoOpContext(comptime ResultType: type) type {
+    return struct {
+        frame: anyframe = undefined,
+        result: ResultType = undefined,
+    };
+}
+
 const ClientHandler = struct {
     io: *IO,
     sock: os.socket_t,
@@ -41,12 +48,9 @@ const ClientHandler = struct {
         }
     }
 
-    const SendContext = struct {
-        frame: anyframe = undefined,
-        result: IO.SendError!usize = undefined,
-    };
+    const SendContext = IoOpContext(IO.SendError!usize);
     fn send(io: *IO, sock: os.socket_t, buffer: []const u8) IO.SendError!usize {
-        var ctx: SendContext = undefined;
+        var ctx: IoOpContext(IO.SendError!usize) = undefined;
         var completion: IO.Completion = undefined;
         io.send(
             *SendContext,
@@ -71,10 +75,7 @@ const ClientHandler = struct {
         resume ctx.frame;
     }
 
-    const RecvContext = struct {
-        frame: anyframe = undefined,
-        result: IO.RecvError!usize = undefined,
-    };
+    const RecvContext = IoOpContext(IO.RecvError!usize);
     fn recv(io: *IO, sock: os.socket_t, buffer: []u8) IO.RecvError!usize {
         var ctx: RecvContext = undefined;
         var completion: IO.Completion = undefined;
@@ -101,10 +102,7 @@ const ClientHandler = struct {
         resume ctx.frame;
     }
 
-    const CloseContext = struct {
-        frame: anyframe = undefined,
-        result: IO.CloseError!void = undefined,
-    };
+    const CloseContext = IoOpContext(IO.CloseError!void);
     fn close(io: *IO, sock: os.socket_t) IO.CloseError!void {
         var ctx: CloseContext = undefined;
         var completion: IO.Completion = undefined;
@@ -174,10 +172,7 @@ const Server = struct {
         while (true) try self.io.tick();
     }
 
-    const AcceptContext = struct {
-        frame: anyframe = undefined,
-        result: IO.AcceptError!os.socket_t = undefined,
-    };
+    const AcceptContext = IoOpContext(IO.AcceptError!os.socket_t);
     fn accept(io: *IO, server_sock: os.socket_t, flags: u32) IO.AcceptError!os.socket_t {
         var ctx: AcceptContext = undefined;
         var completion: IO.Completion = undefined;
