@@ -230,6 +230,9 @@ const IO_Linux = struct {
                 .timeout => |*op| {
                     linux.io_uring_prep_timeout(sqe, &op.timespec, 0, 0);
                 },
+                .timeout_remove => |*op| {
+                    linux.io_uring_prep_timeout_remove(sqe, @as(u64, @ptrToInt(op.timeout_completion)), 0);
+                },
                 .write => |op| {
                     linux.io_uring_prep_write(
                         sqe,
@@ -432,6 +435,18 @@ const IO_Linux = struct {
                     } else unreachable;
                     completion.callback(completion.context, completion, &result);
                 },
+                .timeout_remove => |*op| {
+                    const result = if (completion.result < 0) switch (-completion.result) {
+                        os.EINTR => {
+                            completion.io.enqueue(completion);
+                            return;
+                        },
+                        os.EBUSY => error.AlreadyInProgress,
+                        os.ENOENT => error.NotFound,
+                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                    } else assert(completion.result == 0);
+                    completion.callback(completion.context, completion, &result);
+                },
                 .write => {
                     const result = if (completion.result < 0) switch (-completion.result) {
                         os.EINTR => {
@@ -502,6 +517,9 @@ const IO_Linux = struct {
         },
         timeout: struct {
             timespec: os.__kernel_timespec,
+        },
+        timeout_remove: struct {
+            timeout_completion: *Completion,
         },
         write: struct {
             fd: os.fd_t,
@@ -937,6 +955,41 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub const CancelTimeoutError = error{ AlreadyInProgress, NotFound } || os.UnexpectedError;
+
+    pub fn cancelTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelTimeoutError!void,
+        ) void,
+        completion: *Completion,
+        timeout_completion: *Completion,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const CancelTimeoutError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .timeout_remove = .{
+                    .timeout_completion = timeout_completion,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
     pub const WriteError = error{
         WouldBlock,
         NotOpenForWriting,
@@ -1305,6 +1358,77 @@ test "timeout" {
             result catch @panic("timeout error");
             if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
             self.count += 1;
+        }
+    }.run_test();
+}
+
+test "cancel timeout" {
+    const testing = std.testing;
+
+    const ms = 0;
+    const margin = 5;
+    const count = 10;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        count: u32 = 0,
+        cancel_count: u32 = 0,
+        stop_time: i64 = 0,
+
+        fn run_test() !void {
+            const start_time = std.time.milliTimestamp();
+            var self: Context = .{ .io = try IO.init(32, 0) };
+            defer self.io.deinit();
+
+            var completions: [count]IO.Completion = undefined;
+            var cancel_completions: [count]IO.Completion = undefined;
+            for (completions) |*completion, i| {
+                self.io.timeout(
+                    *Context,
+                    &self,
+                    timeout_callback,
+                    completion,
+                    ms * std.time.ns_per_ms,
+                );
+                self.io.cancelTimeout(
+                    *Context,
+                    &self,
+                    cancel_timeout_callback,
+                    &cancel_completions[i],
+                    completion,
+                );
+            }
+            while (self.count < count) try self.io.tick();
+
+            try self.io.tick();
+            try testing.expectEqual(@as(u32, count), self.count);
+            try testing.expectEqual(@as(u32, count), self.cancel_count);
+            try testing.expectApproxEqAbs(
+                @as(f64, ms),
+                @intToFloat(f64, self.stop_time - start_time),
+                margin,
+            );
+        }
+
+        fn timeout_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.TimeoutError!void,
+        ) void {
+            testing.expectError(error.Canceled, result) catch @panic("cancel timeout unexpected error");
+            if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
+            self.count += 1;
+        }
+
+        fn cancel_timeout_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.CancelTimeoutError!void,
+        ) void {
+            result catch |err| @panic(@errorName(err));
+            self.cancel_count += 1;
         }
     }.run_test();
 }
