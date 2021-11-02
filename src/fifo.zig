@@ -34,13 +34,14 @@ pub fn FIFO(comptime T: type) type {
             return self.out;
         }
 
-        /// Remove an element from the FIFO. Asserts that the element is
-        /// in the FIFO. This operation is O(N), if this is done often you
+        /// Remove an element from the FIFO if that the element is
+        /// in the FIFO. Returns whether the element is found and removed or not.
+        /// This operation is O(N), if this is done often you
         /// probably want a different data structure.
-        pub fn remove(self: *Self, to_remove: *T) void {
+        pub fn remove(self: *Self, to_remove: *T) bool {
             if (to_remove == self.out) {
                 _ = self.pop();
-                return;
+                return true;
             }
             var it = self.out;
             while (it) |elem| : (it = elem.next) {
@@ -48,9 +49,9 @@ pub fn FIFO(comptime T: type) type {
                     if (to_remove == self.in) self.in = elem;
                     elem.next = to_remove.next;
                     to_remove.next = null;
-                    break;
+                    return true;
                 }
-            } else unreachable;
+            } else return false;
         }
     };
 }
@@ -73,7 +74,8 @@ test "push/pop/peek/remove" {
     fifo.push(&three);
     try testing.expectEqual(@as(?*Foo, &one), fifo.peek());
 
-    fifo.remove(&one);
+    try testing.expect(fifo.remove(&one));
+    try testing.expect(!fifo.remove(&one));
     try testing.expectEqual(@as(?*Foo, &two), fifo.pop());
     try testing.expectEqual(@as(?*Foo, &three), fifo.pop());
     try testing.expectEqual(@as(?*Foo, null), fifo.pop());
@@ -81,7 +83,7 @@ test "push/pop/peek/remove" {
     fifo.push(&one);
     fifo.push(&two);
     fifo.push(&three);
-    fifo.remove(&two);
+    try testing.expect(fifo.remove(&two));
     try testing.expectEqual(@as(?*Foo, &one), fifo.pop());
     try testing.expectEqual(@as(?*Foo, &three), fifo.pop());
     try testing.expectEqual(@as(?*Foo, null), fifo.pop());
@@ -89,14 +91,14 @@ test "push/pop/peek/remove" {
     fifo.push(&one);
     fifo.push(&two);
     fifo.push(&three);
-    fifo.remove(&three);
+    try testing.expect(fifo.remove(&three));
     try testing.expectEqual(@as(?*Foo, &one), fifo.pop());
     try testing.expectEqual(@as(?*Foo, &two), fifo.pop());
     try testing.expectEqual(@as(?*Foo, null), fifo.pop());
 
     fifo.push(&one);
     fifo.push(&two);
-    fifo.remove(&two);
+    try testing.expect(fifo.remove(&two));
     fifo.push(&three);
     try testing.expectEqual(@as(?*Foo, &one), fifo.pop());
     try testing.expectEqual(@as(?*Foo, &three), fifo.pop());
