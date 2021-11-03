@@ -10,6 +10,8 @@ An IO event loop extracted from [TigerBeetle](https://github.com/coilhq/tigerbee
     - cancelTimeout
 - target Zig version: 0.8.1
 
+I wrote [a blog post](https://dev.to/hnakamur/experimenting-timeout-and-cancellation-with-zig-asyncawait-and-tigerbeetle-io-53o5) about this. (also backup at [blog.md](blog.md)).
+
 ## How to build
 
 ```bash
