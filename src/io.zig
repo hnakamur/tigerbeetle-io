@@ -1309,6 +1309,118 @@ test "accept/connect/send/receive" {
     }.run_test();
 }
 
+test "accept/connect/receive/cancel" {
+    const testing = std.testing;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        done: bool = false,
+        server: os.socket_t,
+        client: os.socket_t,
+        cancel_completion: IO.Completion = undefined,
+
+        accepted_sock: os.socket_t = undefined,
+
+        recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
+
+        recv_result: IO.RecvError!usize = undefined,
+
+        fn run_test() !void {
+            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const kernel_backlog = 1;
+            const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(server);
+
+            const client = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(client);
+
+            try os.setsockopt(
+                server,
+                os.SOL_SOCKET,
+                os.SO_REUSEADDR,
+                &std.mem.toBytes(@as(c_int, 1)),
+            );
+            try os.bind(server, &address.any, address.getOsSockLen());
+            try os.listen(server, kernel_backlog);
+
+            var self: Context = .{
+                .io = try IO.init(32, 0),
+                .server = server,
+                .client = client,
+            };
+            defer self.io.deinit();
+
+            var client_completion: IO.Completion = undefined;
+            self.io.connect(
+                *Context,
+                &self,
+                connect_callback,
+                &client_completion,
+                client,
+                address,
+            );
+
+            var server_completion: IO.Completion = undefined;
+            self.io.accept(*Context, &self, accept_callback, &server_completion, server, 0);
+
+            while (!self.done) try self.io.tick();
+
+            try testing.expectError(error.Canceled, self.recv_result);
+        }
+
+        fn connect_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.ConnectError!void,
+        ) void {
+            result catch @panic("connect error");
+            self.io.recv(
+                *Context,
+                self,
+                recv_callback,
+                completion,
+                self.client,
+                &self.recv_buf,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+            );
+            self.io.cancel(
+                *Context,
+                self,
+                cancel_callback,
+                &self.cancel_completion,
+                completion,
+            );
+        }
+
+        fn accept_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.AcceptError!os.socket_t,
+        ) void {
+            self.accepted_sock = result catch @panic("accept error");
+        }
+
+        fn recv_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.RecvError!usize,
+        ) void {
+            self.recv_result = result;
+        }
+
+        fn cancel_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.CancelError!void,
+        ) void {
+            result catch @panic("cancel error");
+            self.done = true;
+        }
+    }.run_test();
+}
+
 test "timeout" {
     const testing = std.testing;
 

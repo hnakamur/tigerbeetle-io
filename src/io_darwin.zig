@@ -320,6 +320,52 @@ pub const IO = struct {
         );
     }
 
+    pub const CancelError = error{NotFound} || os.UnexpectedError;
+
+    pub fn cancel(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelError!void,
+        ) void,
+        completion: *Completion,
+        target_completion: *Completion,
+    ) void {
+        target_completion.canceled = true;
+        var removed = self.io_pending.remove(target_completion) or self.completed.remove(target_completion);
+        if (removed) {
+            target_completion.callback(self, target_completion);
+        }
+        const result: CancelError!void = if (removed) {} else error.NotFound;
+        callback(context, completion, result);
+    }
+
+    pub const CancelTimeoutError = error{NotFound} || os.UnexpectedError;
+
+    pub fn cancelTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelTimeoutError!void,
+        ) void,
+        completion: *Completion,
+        timeout_completion: *Completion,
+    ) void {
+        const removed = self.timeouts.remove(timeout_completion);
+        if (removed) {
+            timeout_completion.canceled = true;
+            timeout_completion.callback(self, timeout_completion);
+        }
+        const result: CancelTimeoutError!void = if (removed) {} else error.NotFound;
+        callback(context, completion, result);
+    }
+
     pub const CloseError = error{
         FileDescriptorInvalid,
         DiskQuota,
@@ -669,29 +715,6 @@ pub const IO = struct {
                 }
             },
         );
-    }
-
-    pub const CancelTimeoutError = error{NotFound} || os.UnexpectedError;
-
-    pub fn cancelTimeout(
-        self: *IO,
-        comptime Context: type,
-        context: Context,
-        comptime callback: fn (
-            context: Context,
-            completion: *Completion,
-            result: CancelTimeoutError!void,
-        ) void,
-        completion: *Completion,
-        timeout_completion: *Completion,
-    ) void {
-        const removed = self.timeouts.remove(timeout_completion);
-        if (removed) {
-            timeout_completion.canceled = true;
-            timeout_completion.callback(self, timeout_completion);
-        }
-        const result: CancelTimeoutError!void = if (removed) {} else error.NotFound;
-        callback(context, completion, result);
     }
 
     pub const WriteError = error{Canceled} || os.PWriteError;
