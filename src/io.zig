@@ -196,6 +196,9 @@ const IO_Linux = struct {
                         op.flags,
                     );
                 },
+                .cancel => |*op| {
+                    io_uring_prep_cancel(sqe, @as(u64, @ptrToInt(op.target_completion)), 0);
+                },
                 .close => |op| {
                     linux.io_uring_prep_close(sqe, op.fd);
                 },
@@ -230,6 +233,9 @@ const IO_Linux = struct {
                 .timeout => |*op| {
                     linux.io_uring_prep_timeout(sqe, &op.timespec, 0, 0);
                 },
+                .timeout_remove => |*op| {
+                    linux.io_uring_prep_timeout_remove(sqe, @as(u64, @ptrToInt(op.timeout_completion)), 0);
+                },
                 .write => |op| {
                     linux.io_uring_prep_write(
                         sqe,
@@ -252,6 +258,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNABORTED => error.ConnectionAborted,
                         os.EFAULT => unreachable,
                         os.EINVAL => error.SocketNotListening,
@@ -267,10 +274,23 @@ const IO_Linux = struct {
                     } else @intCast(os.socket_t, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
+                .cancel => |*op| {
+                    const result = if (completion.result < 0) switch (-completion.result) {
+                        os.EINTR => {
+                            completion.io.enqueue(completion);
+                            return;
+                        },
+                        os.EALREADY => error.AlreadyInProgress,
+                        os.ENOENT => error.NotFound,
+                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                    } else assert(completion.result == 0);
+                    completion.callback(completion.context, completion, &result);
+                },
                 .close => {
                     const result = if (completion.result < 0) switch (-completion.result) {
                         os.EINTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.EDQUOT => error.DiskQuota,
                         os.EIO => error.InputOutput,
                         os.ENOSPC => error.NoSpaceLeft,
@@ -291,6 +311,7 @@ const IO_Linux = struct {
                         os.EAGAIN, os.EINPROGRESS => error.WouldBlock,
                         os.EALREADY => error.OpenAlreadyInProgress,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNREFUSED => error.ConnectionRefused,
                         os.ECONNRESET => error.ConnectionResetByPeer,
                         os.EFAULT => unreachable,
@@ -312,6 +333,7 @@ const IO_Linux = struct {
                             return;
                         },
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.EDQUOT => error.DiskQuota,
                         os.EINVAL => error.ArgumentsInvalid,
                         os.EIO => error.InputOutput,
@@ -330,6 +352,7 @@ const IO_Linux = struct {
                         os.EACCES => error.AccessDenied,
                         os.EBADF => error.FileDescriptorInvalid,
                         os.EBUSY => error.DeviceBusy,
+                        os.ECANCELED => error.Canceled,
                         os.EEXIST => error.PathAlreadyExists,
                         os.EFAULT => unreachable,
                         os.EFBIG => error.FileTooBig,
@@ -360,6 +383,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.NotOpenForReading,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNRESET => error.ConnectionResetByPeer,
                         os.EFAULT => unreachable,
                         os.EINVAL => error.Alignment,
@@ -382,6 +406,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNREFUSED => error.ConnectionRefused,
                         os.EFAULT => unreachable,
                         os.EINVAL => unreachable,
@@ -404,6 +429,7 @@ const IO_Linux = struct {
                         os.EALREADY => error.FastOpenAlreadyInProgress,
                         os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNRESET => error.ConnectionResetByPeer,
                         os.EDESTADDRREQ => unreachable,
                         os.EFAULT => unreachable,
@@ -432,6 +458,19 @@ const IO_Linux = struct {
                     } else unreachable;
                     completion.callback(completion.context, completion, &result);
                 },
+                .timeout_remove => |*op| {
+                    const result = if (completion.result < 0) switch (-completion.result) {
+                        os.EINTR => {
+                            completion.io.enqueue(completion);
+                            return;
+                        },
+                        os.ECANCELED => error.Canceled,
+                        os.EBUSY => error.AlreadyInProgress,
+                        os.ENOENT => error.NotFound,
+                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                    } else assert(completion.result == 0);
+                    completion.callback(completion.context, completion, &result);
+                },
                 .write => {
                     const result = if (completion.result < 0) switch (-completion.result) {
                         os.EINTR => {
@@ -440,6 +479,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.NotOpenForWriting,
+                        os.ECANCELED => error.Canceled,
                         os.EDESTADDRREQ => error.NotConnected,
                         os.EDQUOT => error.DiskQuota,
                         os.EFAULT => unreachable,
@@ -467,6 +507,9 @@ const IO_Linux = struct {
             address: os.sockaddr = undefined,
             address_size: os.socklen_t = @sizeOf(os.sockaddr),
             flags: u32,
+        },
+        cancel: struct {
+            target_completion: *Completion,
         },
         close: struct {
             fd: os.fd_t,
@@ -503,6 +546,9 @@ const IO_Linux = struct {
         timeout: struct {
             timespec: os.__kernel_timespec,
         },
+        timeout_remove: struct {
+            timeout_completion: *Completion,
+        },
         write: struct {
             fd: os.fd_t,
             buffer: []const u8,
@@ -522,6 +568,7 @@ const IO_Linux = struct {
         OperationNotSupported,
         PermissionDenied,
         ProtocolFailure,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn accept(
@@ -561,11 +608,84 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub const CancelError = error{ AlreadyInProgress, NotFound } || os.UnexpectedError;
+
+    pub fn cancel(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelError!void,
+        ) void,
+        completion: *Completion,
+        cancel_completion: *Completion,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const CancelError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .cancel = .{
+                    .target_completion = cancel_completion,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const CancelTimeoutError = error{ AlreadyInProgress, NotFound,
+            Canceled,
+ } || os.UnexpectedError;
+
+    pub fn cancelTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelTimeoutError!void,
+        ) void,
+        completion: *Completion,
+        timeout_completion: *Completion,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const CancelTimeoutError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .timeout_remove = .{
+                    .timeout_completion = timeout_completion,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
     pub const CloseError = error{
         FileDescriptorInvalid,
         DiskQuota,
         InputOutput,
         NoSpaceLeft,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn close(
@@ -615,6 +735,7 @@ const IO_Linux = struct {
         PermissionDenied,
         ProtocolNotSupported,
         ConnectionTimedOut,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn connect(
@@ -659,6 +780,7 @@ const IO_Linux = struct {
         InputOutput,
         NoSpaceLeft,
         ReadOnlyFileSystem,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn fsync(
@@ -715,6 +837,7 @@ const IO_Linux = struct {
         NotDir,
         FileLocksNotSupported,
         WouldBlock,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn openat(
@@ -765,6 +888,7 @@ const IO_Linux = struct {
         IsDir,
         SystemResources,
         Unseekable,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn read(
@@ -811,6 +935,7 @@ const IO_Linux = struct {
         SystemResources,
         SocketNotConnected,
         FileDescriptorNotASocket,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn recv(
@@ -863,6 +988,7 @@ const IO_Linux = struct {
         FileDescriptorNotASocket,
         OperationNotSupported,
         BrokenPipe,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn send(
@@ -949,6 +1075,7 @@ const IO_Linux = struct {
         Unseekable,
         AccessDenied,
         BrokenPipe,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn write(
@@ -1001,6 +1128,28 @@ pub fn buffer_limit(buffer_len: usize) usize {
         else => std.math.maxInt(isize),
     };
     return std.math.min(limit, buffer_len);
+}
+
+pub fn io_uring_prep_cancel(
+    sqe: *io_uring_sqe,
+    cancel_user_data: u64,
+    flags: u32,
+) void {
+    sqe.* = .{
+        .opcode = .ASYNC_CANCEL,
+        .flags = 0,
+        .ioprio = 0,
+        .fd = -1,
+        .off = 0,
+        .addr = cancel_user_data,
+        .len = 0,
+        .rw_flags = flags,
+        .user_data = 0,
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .__pad2 = [2]u64{ 0, 0 },
+    };
 }
 
 test "ref all decls" {
@@ -1256,6 +1405,118 @@ test "accept/connect/send/receive" {
     }.run_test();
 }
 
+test "accept/connect/receive/cancel" {
+    const testing = std.testing;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        done: bool = false,
+        server: os.socket_t,
+        client: os.socket_t,
+        cancel_completion: IO.Completion = undefined,
+
+        accepted_sock: os.socket_t = undefined,
+
+        recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
+
+        recv_result: IO.RecvError!usize = undefined,
+
+        fn run_test() !void {
+            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const kernel_backlog = 1;
+            const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(server);
+
+            const client = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(client);
+
+            try os.setsockopt(
+                server,
+                os.SOL_SOCKET,
+                os.SO_REUSEADDR,
+                &std.mem.toBytes(@as(c_int, 1)),
+            );
+            try os.bind(server, &address.any, address.getOsSockLen());
+            try os.listen(server, kernel_backlog);
+
+            var self: Context = .{
+                .io = try IO.init(32, 0),
+                .server = server,
+                .client = client,
+            };
+            defer self.io.deinit();
+
+            var client_completion: IO.Completion = undefined;
+            self.io.connect(
+                *Context,
+                &self,
+                connect_callback,
+                &client_completion,
+                client,
+                address,
+            );
+
+            var server_completion: IO.Completion = undefined;
+            self.io.accept(*Context, &self, accept_callback, &server_completion, server, 0);
+
+            while (!self.done) try self.io.tick();
+
+            try testing.expectError(error.Canceled, self.recv_result);
+        }
+
+        fn connect_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.ConnectError!void,
+        ) void {
+            result catch @panic("connect error");
+            self.io.recv(
+                *Context,
+                self,
+                recv_callback,
+                completion,
+                self.client,
+                &self.recv_buf,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+            );
+            self.io.cancel(
+                *Context,
+                self,
+                cancel_callback,
+                &self.cancel_completion,
+                completion,
+            );
+        }
+
+        fn accept_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.AcceptError!os.socket_t,
+        ) void {
+            self.accepted_sock = result catch @panic("accept error");
+        }
+
+        fn recv_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.RecvError!usize,
+        ) void {
+            self.recv_result = result;
+        }
+
+        fn cancel_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.CancelError!void,
+        ) void {
+            result catch @panic("cancel error");
+            self.done = true;
+        }
+    }.run_test();
+}
+
 test "timeout" {
     const testing = std.testing;
 
@@ -1305,6 +1566,77 @@ test "timeout" {
             result catch @panic("timeout error");
             if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
             self.count += 1;
+        }
+    }.run_test();
+}
+
+test "cancel timeout" {
+    const testing = std.testing;
+
+    const ms = 0;
+    const margin = 5;
+    const count = 10;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        count: u32 = 0,
+        cancel_count: u32 = 0,
+        stop_time: i64 = 0,
+
+        fn run_test() !void {
+            const start_time = std.time.milliTimestamp();
+            var self: Context = .{ .io = try IO.init(32, 0) };
+            defer self.io.deinit();
+
+            var completions: [count]IO.Completion = undefined;
+            var cancel_completions: [count]IO.Completion = undefined;
+            for (completions) |*completion, i| {
+                self.io.timeout(
+                    *Context,
+                    &self,
+                    timeout_callback,
+                    completion,
+                    ms * std.time.ns_per_ms,
+                );
+                self.io.cancelTimeout(
+                    *Context,
+                    &self,
+                    cancel_timeout_callback,
+                    &cancel_completions[i],
+                    completion,
+                );
+            }
+            while (self.count < count) try self.io.tick();
+
+            try self.io.tick();
+            try testing.expectEqual(@as(u32, count), self.count);
+            try testing.expectEqual(@as(u32, count), self.cancel_count);
+            try testing.expectApproxEqAbs(
+                @as(f64, ms),
+                @intToFloat(f64, self.stop_time - start_time),
+                margin,
+            );
+        }
+
+        fn timeout_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.TimeoutError!void,
+        ) void {
+            testing.expectError(error.Canceled, result) catch @panic("cancel timeout unexpected error");
+            if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
+            self.count += 1;
+        }
+
+        fn cancel_timeout_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.CancelTimeoutError!void,
+        ) void {
+            result catch |err| @panic(@errorName(err));
+            self.cancel_count += 1;
         }
     }.run_test();
 }

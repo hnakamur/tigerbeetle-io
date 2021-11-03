@@ -157,7 +157,7 @@ pub const IO = struct {
             // NOTE: remove() could be O(1) here with a doubly-linked-list
             // since we know the previous Completion.
             if (now >= expires) {
-                self.timeouts.remove(completion);
+                _ = self.timeouts.remove(completion);
                 self.completed.push(completion);
                 continue;
             }
@@ -178,6 +178,7 @@ pub const IO = struct {
         context: ?*c_void,
         callback: fn (*IO, *Completion) void,
         operation: Operation,
+        canceled: bool = false,
     };
 
     const Operation = union(enum) {
@@ -245,8 +246,10 @@ pub const IO = struct {
         const onCompleteFn = struct {
             fn onComplete(io: *IO, _completion: *Completion) void {
                 // Perform the actual operaton
-                const op_data = &@field(_completion.operation, @tagName(operation_tag));
-                const result = OperationImpl.doOperation(op_data);
+                const result = if (_completion.canceled) error.Canceled else blk: {
+                    const op_data = &@field(_completion.operation, @tagName(operation_tag));
+                    break :blk OperationImpl.doOperation(op_data);
+                };
 
                 // Requeue onto io_pending if error.WouldBlock
                 switch (operation_tag) {
@@ -285,7 +288,7 @@ pub const IO = struct {
         }
     }
 
-    pub const AcceptError = os.AcceptError;
+    pub const AcceptError = error{Canceled} || os.AcceptError;
 
     pub fn accept(
         self: *IO,
@@ -317,11 +320,58 @@ pub const IO = struct {
         );
     }
 
+    pub const CancelError = error{NotFound} || os.UnexpectedError;
+
+    pub fn cancel(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelError!void,
+        ) void,
+        completion: *Completion,
+        target_completion: *Completion,
+    ) void {
+        target_completion.canceled = true;
+        var removed = self.io_pending.remove(target_completion) or self.completed.remove(target_completion);
+        if (removed) {
+            target_completion.callback(self, target_completion);
+        }
+        const result: CancelError!void = if (removed) {} else error.NotFound;
+        callback(context, completion, result);
+    }
+
+    pub const CancelTimeoutError = error{NotFound} || os.UnexpectedError;
+
+    pub fn cancelTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelTimeoutError!void,
+        ) void,
+        completion: *Completion,
+        timeout_completion: *Completion,
+    ) void {
+        const removed = self.timeouts.remove(timeout_completion);
+        if (removed) {
+            timeout_completion.canceled = true;
+            timeout_completion.callback(self, timeout_completion);
+        }
+        const result: CancelTimeoutError!void = if (removed) {} else error.NotFound;
+        callback(context, completion, result);
+    }
+
     pub const CloseError = error{
         FileDescriptorInvalid,
         DiskQuota,
         InputOutput,
         NoSpaceLeft,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn close(
@@ -358,7 +408,7 @@ pub const IO = struct {
         );
     }
 
-    pub const ConnectError = os.ConnectError;
+    pub const ConnectError = error{Canceled} || os.ConnectError;
 
     pub fn connect(
         self: *IO,
@@ -407,6 +457,7 @@ pub const IO = struct {
         NoSpaceLeft,
         ReadOnlyFileSystem,
         AccessDenied,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn fsync(
@@ -460,6 +511,7 @@ pub const IO = struct {
         BadPathName,
         InvalidUtf8,
         WouldBlock,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn openat(
@@ -505,6 +557,7 @@ pub const IO = struct {
         IsDir,
         SystemResources,
         Unseekable,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn read(
@@ -564,7 +617,7 @@ pub const IO = struct {
         );
     }
 
-    pub const RecvError = os.RecvFromError;
+    pub const RecvError = error{Canceled} || os.RecvFromError;
 
     pub fn recv(
         self: *IO,
@@ -599,7 +652,7 @@ pub const IO = struct {
         );
     }
 
-    pub const SendError = os.SendError;
+    pub const SendError = error{Canceled} || os.SendError;
 
     pub fn send(
         self: *IO,
@@ -664,7 +717,7 @@ pub const IO = struct {
         );
     }
 
-    pub const WriteError = os.PWriteError;
+    pub const WriteError = error{Canceled} || os.PWriteError;
 
     pub fn write(
         self: *IO,
