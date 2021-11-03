@@ -643,9 +643,11 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
-    pub const CancelTimeoutError = error{ AlreadyInProgress, NotFound,
-            Canceled,
- } || os.UnexpectedError;
+    pub const CancelTimeoutError = error{
+        AlreadyInProgress,
+        NotFound,
+        Canceled,
+    } || os.UnexpectedError;
 
     pub fn cancelTimeout(
         self: *IO,

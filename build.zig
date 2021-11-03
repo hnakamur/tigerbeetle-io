@@ -19,7 +19,9 @@ pub fn build(b: *std.build.Builder) void {
     const example_step = b.step("examples", "Build examples");
     inline for (.{
         "async_tcp_echo_client",
+        "async_tcp_echo_client_timeout",
         "async_tcp_echo_server",
+        "async_tcp_echo_server_delay",
         "hello",
         "tcp_echo_client",
         "tcp_echo_server",
