@@ -196,6 +196,9 @@ const IO_Linux = struct {
                         op.flags,
                     );
                 },
+                .cancel => |*op| {
+                    io_uring_prep_cancel(sqe, @as(u64, @ptrToInt(op.target_completion)), 0);
+                },
                 .close => |op| {
                     linux.io_uring_prep_close(sqe, op.fd);
                 },
@@ -255,6 +258,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNABORTED => error.ConnectionAborted,
                         os.EFAULT => unreachable,
                         os.EINVAL => error.SocketNotListening,
@@ -270,10 +274,23 @@ const IO_Linux = struct {
                     } else @intCast(os.socket_t, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
+                .cancel => |*op| {
+                    const result = if (completion.result < 0) switch (-completion.result) {
+                        os.EINTR => {
+                            completion.io.enqueue(completion);
+                            return;
+                        },
+                        os.EALREADY => error.AlreadyInProgress,
+                        os.ENOENT => error.NotFound,
+                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                    } else assert(completion.result == 0);
+                    completion.callback(completion.context, completion, &result);
+                },
                 .close => {
                     const result = if (completion.result < 0) switch (-completion.result) {
                         os.EINTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.EDQUOT => error.DiskQuota,
                         os.EIO => error.InputOutput,
                         os.ENOSPC => error.NoSpaceLeft,
@@ -294,6 +311,7 @@ const IO_Linux = struct {
                         os.EAGAIN, os.EINPROGRESS => error.WouldBlock,
                         os.EALREADY => error.OpenAlreadyInProgress,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNREFUSED => error.ConnectionRefused,
                         os.ECONNRESET => error.ConnectionResetByPeer,
                         os.EFAULT => unreachable,
@@ -315,6 +333,7 @@ const IO_Linux = struct {
                             return;
                         },
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.EDQUOT => error.DiskQuota,
                         os.EINVAL => error.ArgumentsInvalid,
                         os.EIO => error.InputOutput,
@@ -333,6 +352,7 @@ const IO_Linux = struct {
                         os.EACCES => error.AccessDenied,
                         os.EBADF => error.FileDescriptorInvalid,
                         os.EBUSY => error.DeviceBusy,
+                        os.ECANCELED => error.Canceled,
                         os.EEXIST => error.PathAlreadyExists,
                         os.EFAULT => unreachable,
                         os.EFBIG => error.FileTooBig,
@@ -363,6 +383,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.NotOpenForReading,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNRESET => error.ConnectionResetByPeer,
                         os.EFAULT => unreachable,
                         os.EINVAL => error.Alignment,
@@ -385,6 +406,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNREFUSED => error.ConnectionRefused,
                         os.EFAULT => unreachable,
                         os.EINVAL => unreachable,
@@ -407,6 +429,7 @@ const IO_Linux = struct {
                         os.EALREADY => error.FastOpenAlreadyInProgress,
                         os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
                         os.EBADF => error.FileDescriptorInvalid,
+                        os.ECANCELED => error.Canceled,
                         os.ECONNRESET => error.ConnectionResetByPeer,
                         os.EDESTADDRREQ => unreachable,
                         os.EFAULT => unreachable,
@@ -441,6 +464,7 @@ const IO_Linux = struct {
                             completion.io.enqueue(completion);
                             return;
                         },
+                        os.ECANCELED => error.Canceled,
                         os.EBUSY => error.AlreadyInProgress,
                         os.ENOENT => error.NotFound,
                         else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
@@ -455,6 +479,7 @@ const IO_Linux = struct {
                         },
                         os.EAGAIN => error.WouldBlock,
                         os.EBADF => error.NotOpenForWriting,
+                        os.ECANCELED => error.Canceled,
                         os.EDESTADDRREQ => error.NotConnected,
                         os.EDQUOT => error.DiskQuota,
                         os.EFAULT => unreachable,
@@ -482,6 +507,9 @@ const IO_Linux = struct {
             address: os.sockaddr = undefined,
             address_size: os.socklen_t = @sizeOf(os.sockaddr),
             flags: u32,
+        },
+        cancel: struct {
+            target_completion: *Completion,
         },
         close: struct {
             fd: os.fd_t,
@@ -540,6 +568,7 @@ const IO_Linux = struct {
         OperationNotSupported,
         PermissionDenied,
         ProtocolFailure,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn accept(
@@ -579,11 +608,84 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub const CancelError = error{ AlreadyInProgress, NotFound } || os.UnexpectedError;
+
+    pub fn cancel(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelError!void,
+        ) void,
+        completion: *Completion,
+        cancel_completion: *Completion,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const CancelError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .cancel = .{
+                    .target_completion = cancel_completion,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub const CancelTimeoutError = error{ AlreadyInProgress, NotFound,
+            Canceled,
+ } || os.UnexpectedError;
+
+    pub fn cancelTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: CancelTimeoutError!void,
+        ) void,
+        completion: *Completion,
+        timeout_completion: *Completion,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const CancelTimeoutError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .timeout_remove = .{
+                    .timeout_completion = timeout_completion,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
     pub const CloseError = error{
         FileDescriptorInvalid,
         DiskQuota,
         InputOutput,
         NoSpaceLeft,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn close(
@@ -633,6 +735,7 @@ const IO_Linux = struct {
         PermissionDenied,
         ProtocolNotSupported,
         ConnectionTimedOut,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn connect(
@@ -677,6 +780,7 @@ const IO_Linux = struct {
         InputOutput,
         NoSpaceLeft,
         ReadOnlyFileSystem,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn fsync(
@@ -733,6 +837,7 @@ const IO_Linux = struct {
         NotDir,
         FileLocksNotSupported,
         WouldBlock,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn openat(
@@ -783,6 +888,7 @@ const IO_Linux = struct {
         IsDir,
         SystemResources,
         Unseekable,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn read(
@@ -829,6 +935,7 @@ const IO_Linux = struct {
         SystemResources,
         SocketNotConnected,
         FileDescriptorNotASocket,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn recv(
@@ -881,6 +988,7 @@ const IO_Linux = struct {
         FileDescriptorNotASocket,
         OperationNotSupported,
         BrokenPipe,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn send(
@@ -955,41 +1063,6 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
-    pub const CancelTimeoutError = error{ AlreadyInProgress, NotFound } || os.UnexpectedError;
-
-    pub fn cancelTimeout(
-        self: *IO,
-        comptime Context: type,
-        context: Context,
-        comptime callback: fn (
-            context: Context,
-            completion: *Completion,
-            result: CancelTimeoutError!void,
-        ) void,
-        completion: *Completion,
-        timeout_completion: *Completion,
-    ) void {
-        completion.* = .{
-            .io = self,
-            .context = context,
-            .callback = struct {
-                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
-                    callback(
-                        @intToPtr(Context, @ptrToInt(ctx)),
-                        comp,
-                        @intToPtr(*const CancelTimeoutError!void, @ptrToInt(res)).*,
-                    );
-                }
-            }.wrapper,
-            .operation = .{
-                .timeout_remove = .{
-                    .timeout_completion = timeout_completion,
-                },
-            },
-        };
-        self.enqueue(completion);
-    }
-
     pub const WriteError = error{
         WouldBlock,
         NotOpenForWriting,
@@ -1002,6 +1075,7 @@ const IO_Linux = struct {
         Unseekable,
         AccessDenied,
         BrokenPipe,
+        Canceled,
     } || os.UnexpectedError;
 
     pub fn write(
@@ -1054,6 +1128,28 @@ pub fn buffer_limit(buffer_len: usize) usize {
         else => std.math.maxInt(isize),
     };
     return std.math.min(limit, buffer_len);
+}
+
+pub fn io_uring_prep_cancel(
+    sqe: *io_uring_sqe,
+    cancel_user_data: u64,
+    flags: u32,
+) void {
+    sqe.* = .{
+        .opcode = .ASYNC_CANCEL,
+        .flags = 0,
+        .ioprio = 0,
+        .fd = -1,
+        .off = 0,
+        .addr = cancel_user_data,
+        .len = 0,
+        .rw_flags = flags,
+        .user_data = 0,
+        .buf_index = 0,
+        .personality = 0,
+        .splice_fd_in = 0,
+        .__pad2 = [2]u64{ 0, 0 },
+    };
 }
 
 test "ref all decls" {
