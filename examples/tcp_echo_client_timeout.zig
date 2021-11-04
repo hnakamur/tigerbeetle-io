@@ -53,6 +53,15 @@ const Client = struct {
         completion: *IO.Completion,
         result: IO.ConnectError!void,
     ) void {
+        if (result) |_| {
+            self.sendHello();
+        } else |err| {
+            std.debug.print("connectCallback err={s}\n", .{@errorName(err)});
+            self.done = true;
+        }
+    }
+
+    fn sendHello(self: *Client) void {
         var fbs = std.io.fixedBufferStream(self.send_buf);
         var w = fbs.writer();
         std.fmt.format(w, "Hello from client!\n", .{}) catch unreachable;
@@ -61,7 +70,7 @@ const Client = struct {
             *Client,
             self,
             sendCallback,
-            completion,
+            &self.completion,
             self.sock,
             fbs.getWritten(),
             if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
@@ -75,6 +84,11 @@ const Client = struct {
     ) void {
         const sent = result catch @panic("send error");
         std.debug.print("Sent:     {s}", .{self.send_buf[0..sent]});
+
+        self.recvWithTimeout();
+    }
+
+    fn recvWithTimeout(self: *Client) void {
         self.io.recv(
             *Client,
             self,
@@ -140,13 +154,7 @@ const Client = struct {
         result: IO.CancelError!void,
     ) void {
         std.debug.print("cancelRecvCallback start\n", .{});
-        self.io.close(
-            *Client,
-            self,
-            closeCallback,
-            &self.completion,
-            self.sock,
-        );
+        self.close();
     }
     fn cancelTimeoutCallback(
         self: *Client,
@@ -154,6 +162,10 @@ const Client = struct {
         result: IO.CancelTimeoutError!void,
     ) void {
         std.debug.print("cancelTimeoutCallback start\n", .{});
+        self.close();
+    }
+
+    fn close(self: *Client) void {
         self.io.close(
             *Client,
             self,
@@ -162,7 +174,6 @@ const Client = struct {
             self.sock,
         );
     }
-
     fn closeCallback(
         self: *Client,
         completion: *IO.Completion,
