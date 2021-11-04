@@ -2,21 +2,25 @@ const std = @import("std");
 const mem = std.mem;
 const net = std.net;
 const os = std.os;
+const time = std.time;
 const IO = @import("tigerbeetle-io").IO;
 
 const ClientHandler = struct {
     io: *IO,
     sock: os.socket_t,
+    delay_ns: u63,
     recv_buf: []u8,
+    received: usize = 0,
     allocator: *mem.Allocator,
     completion: IO.Completion,
 
-    fn init(allocator: *mem.Allocator, io: *IO, sock: os.socket_t) !*ClientHandler {
+    fn init(allocator: *mem.Allocator, io: *IO, sock: os.socket_t, delay_ns: u63) !*ClientHandler {
         var buf = try allocator.alloc(u8, 1024);
         var self = try allocator.create(ClientHandler);
         self.* = ClientHandler{
             .io = io,
             .sock = sock,
+            .delay_ns = delay_ns,
             .recv_buf = buf,
             .allocator = allocator,
             .completion = undefined,
@@ -50,8 +54,8 @@ const ClientHandler = struct {
         completion: *IO.Completion,
         result: IO.RecvError!usize,
     ) void {
-        const received = result catch @panic("recv error");
-        if (received == 0) {
+        self.received = result catch @panic("recv error");
+        if (self.received == 0) {
             self.io.close(
                 *ClientHandler,
                 self,
@@ -61,13 +65,27 @@ const ClientHandler = struct {
             );
             return;
         }
+        self.io.timeout(
+            *ClientHandler,
+            self,
+            timeoutCallback,
+            completion,
+            self.delay_ns,
+        );
+    }
+
+    fn timeoutCallback(
+        self: *ClientHandler,
+        completion: *IO.Completion,
+        result: IO.TimeoutError!void,
+    ) void {
         self.io.send(
             *ClientHandler,
             self,
             sendCallback,
             completion,
             self.sock,
-            self.recv_buf[0..received],
+            self.recv_buf[0..self.received],
             if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
         );
     }
@@ -94,9 +112,10 @@ const ClientHandler = struct {
 const Server = struct {
     io: IO,
     server: os.socket_t,
+    delay_ns: u63,
     allocator: *mem.Allocator,
 
-    fn init(allocator: *mem.Allocator, address: std.net.Address) !Server {
+    fn init(allocator: *mem.Allocator, address: std.net.Address, delay_ns: u63) !Server {
         const kernel_backlog = 1;
         const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
 
@@ -112,6 +131,7 @@ const Server = struct {
         var self: Server = .{
             .io = try IO.init(32, 0),
             .server = server,
+            .delay_ns = delay_ns,
             .allocator = allocator,
         };
 
@@ -135,7 +155,7 @@ const Server = struct {
         result: IO.AcceptError!os.socket_t,
     ) void {
         const accepted_sock = result catch @panic("accept error");
-        var handler = ClientHandler.init(self.allocator, &self.io, accepted_sock) catch @panic("handler create error");
+        var handler = ClientHandler.init(self.allocator, &self.io, accepted_sock, self.delay_ns) catch @panic("handler create error");
         handler.start() catch @panic("handler");
         self.io.accept(*Server, self, acceptCallback, completion, self.server, 0);
     }
@@ -144,7 +164,20 @@ const Server = struct {
 pub fn main() anyerror!void {
     const allocator = std.heap.page_allocator;
     const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
-    var server = try Server.init(allocator, address);
+
+    var delay: u63 = std.time.ns_per_s;
+    var args = std.process.args();
+    if (args.nextPosix()) |_| {
+        if (args.nextPosix()) |arg| {
+            if (std.fmt.parseInt(u63, arg, 10)) |v| {
+                delay = v * std.time.ns_per_ms;
+            } else |_| {}
+        }
+    }
+    std.debug.print("delay={d} ms.\n", .{delay / time.ns_per_ms});
+
+    var server = try Server.init(allocator, address, delay);
     defer server.deinit();
+
     try server.run();
 }

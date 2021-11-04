@@ -24,7 +24,9 @@ pub fn build(b: *std.build.Builder) void {
         "async_tcp_echo_server_delay",
         "hello",
         "tcp_echo_client",
+        "tcp_echo_client_timeout",
         "tcp_echo_server",
+        "tcp_echo_server_delay",
     }) |example_name| {
         const example = b.addExecutable(example_name, "examples/" ++ example_name ++ ".zig");
         example.addPackagePath("tigerbeetle-io", "src/io.zig");
