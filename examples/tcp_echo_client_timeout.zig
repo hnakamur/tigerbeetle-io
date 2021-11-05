@@ -14,11 +14,7 @@ const Client = struct {
     send_buf: []u8,
     recv_buf: []u8,
     allocator: *mem.Allocator,
-    completion: IO.Completion = undefined,
-    recv_completion: IO.Completion = undefined,
-    timeout_completion: IO.Completion = undefined,
-    cancel_recv_completion: IO.Completion = undefined,
-    cancel_timeout_completion: IO.Completion = undefined,
+    completions: [2]IO.Completion = undefined,
     done: bool = false,
 
     fn init(allocator: *mem.Allocator, address: std.net.Address, recv_timeout_ns: u63) !Client {
@@ -44,7 +40,7 @@ const Client = struct {
     }
 
     pub fn run(self: *Client) !void {
-        self.io.connect(*Client, self, connectCallback, &self.completion, self.sock, self.address);
+        self.io.connect(*Client, self, connectCallback, &self.completions[0], self.sock, self.address);
         while (!self.done) try self.io.tick();
     }
 
@@ -70,7 +66,7 @@ const Client = struct {
             *Client,
             self,
             sendCallback,
-            &self.completion,
+            &self.completions[0],
             self.sock,
             fbs.getWritten(),
             if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
@@ -93,7 +89,7 @@ const Client = struct {
             *Client,
             self,
             recvCallback,
-            &self.recv_completion,
+            &self.completions[0],
             self.sock,
             self.recv_buf,
             if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
@@ -102,7 +98,7 @@ const Client = struct {
             *Client,
             self,
             timeoutCallback,
-            &self.timeout_completion,
+            &self.completions[1],
             self.recv_timeout_ns,
         );
     }
@@ -117,8 +113,8 @@ const Client = struct {
                 *Client,
                 self,
                 cancelTimeoutCallback,
-                &self.cancel_timeout_completion,
-                &self.timeout_completion,
+                &self.completions[0],
+                &self.completions[1],
             );
         } else |err| {
             std.debug.print("recvCallback err={s}\n", .{@errorName(err)});
@@ -138,8 +134,8 @@ const Client = struct {
                 *Client,
                 self,
                 cancelRecvCallback,
-                &self.cancel_recv_completion,
-                &self.recv_completion,
+                &self.completions[1],
+                &self.completions[0],
             );
         } else |err| {
             std.debug.print("timeoutCallback err={s}\n", .{@errorName(err)});
@@ -170,7 +166,7 @@ const Client = struct {
             *Client,
             self,
             closeCallback,
-            &self.completion,
+            &self.completions[0],
             self.sock,
         );
     }
