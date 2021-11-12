@@ -823,6 +823,69 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub fn connectWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: ConnectError!void,
+        ) void,
+        completion: *Completion,
+        socket: os.socket_t,
+        address: std.net.Address,
+        comptime timeout_callback: ?fn (
+            context: Context,
+            completion: *Completion,
+            result: TimeoutError!void,
+        ) void,
+        timeout_completion: *Completion,
+        timeout_ns: u63,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const ConnectError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .connect = .{
+                    .socket = socket,
+                    .address = address,
+                },
+            },
+            .linked = true,
+        };
+        timeout_completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = if (timeout_callback) |cb| struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    cb(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper else struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {}
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        self.enqueueLinked(completion, timeout_completion);
+    }
+
     pub const FsyncError = error{
         FileDescriptorInvalid,
         DiskQuota,
@@ -1124,6 +1187,7 @@ const IO_Linux = struct {
         };
         self.enqueueLinked(completion, timeout_completion);
     }
+
     pub const SendError = error{
         AccessDenied,
         WouldBlock,
@@ -1175,6 +1239,71 @@ const IO_Linux = struct {
             },
         };
         self.enqueue(completion);
+    }
+
+    pub fn sendWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: SendError!usize,
+        ) void,
+        completion: *Completion,
+        socket: os.socket_t,
+        buffer: []const u8,
+        send_flags: u32,
+        comptime timeout_callback: ?fn (
+            context: Context,
+            completion: *Completion,
+            result: TimeoutError!void,
+        ) void,
+        timeout_completion: *Completion,
+        timeout_ns: u63,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const SendError!usize, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .send = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                    .flags = send_flags,
+                },
+            },
+            .linked = true,
+        };
+        timeout_completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = if (timeout_callback) |cb| struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    cb(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper else struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {}
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        self.enqueueLinked(completion, timeout_completion);
     }
 
     pub const TimeoutError = error{Canceled} || os.UnexpectedError;
@@ -1666,7 +1795,7 @@ test "accept/connect/receive/cancel" {
     }.run_test();
 }
 
-test "accept/connect/send/receive/link_timeout" {
+test "accept/connect/send/recvWithTimeout" {
     const testing = std.testing;
 
     try struct {
@@ -1805,7 +1934,7 @@ test "accept/connect/send/receive/link_timeout" {
     }.run_test();
 }
 
-test "accept/connect/send/receive/link_timeout_without_callback" {
+test "accept/connect/send/recvWithTimeout_no_callback" {
     const testing = std.testing;
 
     try struct {
@@ -1928,7 +2057,7 @@ test "accept/connect/send/receive/link_timeout_without_callback" {
     }.run_test();
 }
 
-test "accept/connect/receive/link_timeout" {
+test "accept/connect/recvWithTimeout" {
     const testing = std.testing;
 
     try struct {
@@ -2048,7 +2177,7 @@ test "accept/connect/receive/link_timeout" {
     }.run_test();
 }
 
-test "accept/connect/receive/link_timeout_without_callback" {
+test "accept/connect/recvWithTimeout_no_callback" {
     const testing = std.testing;
 
     try struct {
@@ -2147,6 +2276,134 @@ test "accept/connect/receive/link_timeout_without_callback" {
         }
     }.run_test();
 }
+
+// test "accept/connect/sendWithTimeout" {
+//     const testing = std.testing;
+
+//     try struct {
+//         const Context = @This();
+
+//         io: IO,
+//         done: bool = false,
+//         server: os.socket_t,
+//         client: os.socket_t,
+
+//         accepted_sock: os.socket_t = undefined,
+
+//         send_buf: [10]u8 = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0, 1, 0 },
+//         recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
+
+//         send_result: IO.SendError!usize = 0,
+//         send_callback_called: bool = false,
+//         received: usize = 0,
+
+//         link_timeout_completion: IO.Completion = undefined,
+//         link_timeout_result: IO.LinkTimeoutError!void = undefined,
+//         link_timeout_callback_called: bool = false,
+
+//         fn run_test() !void {
+//             const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+//             const kernel_backlog = 1;
+//             const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+//             defer os.close(server);
+
+//             const client = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+//             defer os.close(client);
+
+//             try os.setsockopt(
+//                 server,
+//                 os.SOL_SOCKET,
+//                 os.SO_REUSEADDR,
+//                 &std.mem.toBytes(@as(c_int, 1)),
+//             );
+//             try os.bind(server, &address.any, address.getOsSockLen());
+//             try os.listen(server, kernel_backlog);
+
+//             var self: Context = .{
+//                 .io = try IO.init(32, 0),
+//                 .server = server,
+//                 .client = client,
+//             };
+//             defer self.io.deinit();
+
+//             var client_completion: IO.Completion = undefined;
+//             self.io.connect(
+//                 *Context,
+//                 &self,
+//                 connect_callback,
+//                 &client_completion,
+//                 client,
+//                 address,
+//             );
+
+//             var server_completion: IO.Completion = undefined;
+//             self.io.accept(*Context, &self, accept_callback, &server_completion, server, 0);
+
+//             while (!self.done) try self.io.tick();
+
+//             try testing.expectError(error.Canceled, self.send_result);
+//             if (self.link_timeout_result) |_| {} else |err| {
+//                 std.debug.print("link_timeout_result expected no error, fount error {s}", .{
+//                     @errorName(err),
+//                 });
+//                 return error.TestExpectedError;
+//             }
+//         }
+
+//         fn connect_callback(
+//             self: *Context,
+//             completion: *IO.Completion,
+//             result: IO.ConnectError!void,
+//         ) void {
+//             result catch @panic("connect error");
+//             self.io.sendWithTimeout(
+//                 *Context,
+//                 self,
+//                 send_callback,
+//                 completion,
+//                 self.client,
+//                 &self.send_buf,
+//                 if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+//                 link_timeout_callback,
+//                 &self.link_timeout_completion,
+//                 std.time.ns_per_ms,
+//             );
+//             std.debug.print("after sendWithTimeout\n", .{});
+//         }
+
+//         fn send_callback(
+//             self: *Context,
+//             completion: *IO.Completion,
+//             result: IO.SendError!usize,
+//         ) void {
+//             std.debug.print("send_callback result={}\n", .{result});
+//             self.send_result = result;
+//             self.send_callback_called = true;
+//             if (self.link_timeout_callback_called) self.done = true;
+//             std.debug.print("exit send_callback self.done={}\n", .{self.done});
+//         }
+
+//         fn link_timeout_callback(
+//             self: *Context,
+//             completion: *IO.Completion,
+//             result: IO.LinkTimeoutError!void,
+//         ) void {
+//             std.debug.print("link_timeout_callback result={}\n", .{result});
+//             self.link_timeout_result = result;
+//             self.link_timeout_callback_called = true;
+//             if (self.send_callback_called) self.done = true;
+//             std.debug.print("exit link_timeout_callback self.done={}\n", .{self.done});
+//         }
+
+//         fn accept_callback(
+//             self: *Context,
+//             completion: *IO.Completion,
+//             result: IO.AcceptError!os.socket_t,
+//         ) void {
+//             self.accepted_sock = result catch @panic("accept error");
+//         }
+//     }.run_test();
+// }
 
 test "timeout" {
     const testing = std.testing;
