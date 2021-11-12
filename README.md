@@ -6,6 +6,8 @@ An IO event loop extracted from [TigerBeetle](https://github.com/coilhq/tigerbee
 - written in Zig
 - uses io_uring on Linux, kqueue on macOS
 - enhanced features from TigerBeetle IO
+    - connectWithTimeout, sendWithTimeout, recvWithTimeout (implemented for Linux only)
+        - These are using [io_uring linked timeouts](https://lwn.net/Articles/803932/) and more efficient than using normal timeouts and manual cancellations.
     - cancel
     - cancelTimeout
 - target Zig version: 0.8.1
