@@ -110,7 +110,15 @@ const IO_Linux = struct {
         {
             var copy = self.unqueued;
             self.unqueued = .{};
-            while (copy.pop()) |completion| self.enqueue(completion);
+            while (copy.pop()) |completion| {
+                if (completion.linked) {
+                    if (copy.pop()) |completion2| {
+                        self.enqueueLinked(completion, completion2);
+                    }
+                } else {
+                    self.enqueue(completion);
+                }
+            }
         }
     }
 
@@ -175,12 +183,32 @@ const IO_Linux = struct {
         completion.prep(sqe);
     }
 
+    fn enqueueLinked(self: *IO, completion1: *Completion, completion2: *Completion) void {
+        const sqe1 = self.ring.get_sqe() catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.unqueued.push(completion1);
+                self.unqueued.push(completion2);
+                return;
+            },
+        };
+        const sqe2 = self.ring.get_sqe() catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.unqueued.push(completion1);
+                self.unqueued.push(completion2);
+                return;
+            },
+        };
+        completion1.prep(sqe1);
+        completion2.prep(sqe2);
+    }
+
     /// This struct holds the data needed for a single io_uring operation
     pub const Completion = struct {
         io: *IO,
         result: i32 = undefined,
         next: ?*Completion = null,
         operation: Operation,
+        linked: bool = false,
         // This is one of the usecases for c_void outside of C code and as such c_void will
         // be replaced with anyopaque eventually: https://github.com/ziglang/zig/issues/323
         context: ?*c_void,
@@ -250,6 +278,7 @@ const IO_Linux = struct {
                 },
             }
             sqe.user_data = @ptrToInt(completion);
+            if (completion.linked) sqe.flags |= linux.IOSQE_IO_LINK;
         }
 
         fn complete(completion: *Completion) void {
@@ -1031,6 +1060,68 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub fn recvWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: RecvError!usize,
+        ) void,
+        completion: *Completion,
+        socket: os.socket_t,
+        buffer: []u8,
+        recv_flags: u32,
+        comptime timeout_callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: TimeoutError!void,
+        ) void,
+        timeout_completion: *Completion,
+        timeout_ns: u63,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const RecvError!usize, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .recv = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                    .flags = recv_flags,
+                },
+            },
+            .linked = true,
+        };
+        timeout_completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    timeout_callback(
+                        @intToPtr(Context, @ptrToInt(ctx)),
+                        comp,
+                        @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*,
+                    );
+                }
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        self.enqueueLinked(completion, timeout_completion);
+    }
     pub const SendError = error{
         AccessDenied,
         WouldBlock,
@@ -1591,6 +1682,7 @@ test "accept/connect/send/receive/link_timeout" {
 
         sent: usize = 0,
         received: usize = 0,
+        recv_callback_called: bool = false,
 
         link_timeout_completion: IO.Completion = undefined,
         link_timeout_result: IO.LinkTimeoutError!void = undefined,
@@ -1641,7 +1733,7 @@ test "accept/connect/send/receive/link_timeout" {
 
             try testing.expectEqualSlices(u8, self.send_buf[0..self.received], &self.recv_buf);
 
-            try testing.expect(!self.link_timeout_callback_called);
+            try testing.expectError(error.Canceled, self.link_timeout_result);
         }
 
         fn connect_callback(
@@ -1675,21 +1767,17 @@ test "accept/connect/send/receive/link_timeout" {
             result: IO.AcceptError!os.socket_t,
         ) void {
             self.accepted_sock = result catch @panic("accept error");
-            self.io.recv(
+            self.io.recvWithTimeout(
                 *Context,
                 self,
                 recv_callback,
                 completion,
                 self.accepted_sock,
                 &self.recv_buf,
-                (if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0) | linux.IOSQE_IO_LINK,
-            );
-            self.io.linkTimeout(
-                *Context,
-                self,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
                 link_timeout_callback,
                 &self.link_timeout_completion,
-                std.time.ns_per_us,
+                std.time.ns_per_ms,
             );
         }
 
@@ -1699,7 +1787,8 @@ test "accept/connect/send/receive/link_timeout" {
             result: IO.RecvError!usize,
         ) void {
             self.received = result catch @panic("recv error");
-            self.done = true;
+            self.recv_callback_called = true;
+            if (self.link_timeout_callback_called) self.done = true;
         }
 
         fn link_timeout_callback(
@@ -1708,7 +1797,8 @@ test "accept/connect/send/receive/link_timeout" {
             result: IO.LinkTimeoutError!void,
         ) void {
             self.link_timeout_result = result;
-            self.done = true;
+            self.link_timeout_callback_called = true;
+            if (self.recv_callback_called) self.done = true;
         }
     }.run_test();
 }
@@ -1730,11 +1820,12 @@ test "accept/connect/receive/link_timeout" {
         recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
 
         recv_result: IO.RecvError!usize = undefined,
-        link_timeout_result: IO.LinkTimeoutError!void = undefined,
         recv_callback_called: bool = false,
+        link_timeout_result: IO.LinkTimeoutError!void = undefined,
+        link_timeout_callback_called: bool = false,
 
         fn run_test() !void {
-            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const address = try std.net.Address.parseIp4("127.0.0.1", 3133);
             const kernel_backlog = 1;
             const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
             defer os.close(server);
@@ -1773,7 +1864,7 @@ test "accept/connect/receive/link_timeout" {
 
             while (!self.done) try self.io.tick();
 
-            try testing.expect(!self.recv_callback_called);
+            try testing.expectError(error.Canceled, self.recv_result);
             if (self.link_timeout_result) |_| {} else |err| {
                 std.debug.print("link_timeout_result expected no error, fount error {s}", .{
                     @errorName(err),
@@ -1788,21 +1879,17 @@ test "accept/connect/receive/link_timeout" {
             result: IO.ConnectError!void,
         ) void {
             result catch @panic("connect error");
-            self.io.recv(
+            self.io.recvWithTimeout(
                 *Context,
                 self,
                 recv_callback,
                 completion,
                 self.client,
                 &self.recv_buf,
-                (if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0) | linux.IOSQE_IO_LINK,
-            );
-            self.io.linkTimeout(
-                *Context,
-                self,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
                 link_timeout_callback,
                 &self.link_timeout_completion,
-                std.time.ns_per_us,
+                std.time.ns_per_ms,
             );
         }
 
@@ -1821,7 +1908,7 @@ test "accept/connect/receive/link_timeout" {
         ) void {
             self.recv_result = result;
             self.recv_callback_called = true;
-            self.done = true;
+            if (self.link_timeout_callback_called) self.done = true;
         }
 
         fn link_timeout_callback(
@@ -1830,7 +1917,8 @@ test "accept/connect/receive/link_timeout" {
             result: IO.LinkTimeoutError!void,
         ) void {
             self.link_timeout_result = result;
-            self.done = true;
+            self.link_timeout_callback_called = true;
+            if (self.recv_callback_called) self.done = true;
         }
     }.run_test();
 }
