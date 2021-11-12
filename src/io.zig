@@ -5,6 +5,7 @@ const linux = os.linux;
 const IO_Uring = linux.IO_Uring;
 const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
+const io_uring_prep_link_timeout = @import("link_timeout.zig").io_uring_prep_link_timeout;
 
 const FIFO = @import("fifo.zig").FIFO;
 const IO_Darwin = @import("io_darwin.zig").IO;
@@ -109,7 +110,15 @@ const IO_Linux = struct {
         {
             var copy = self.unqueued;
             self.unqueued = .{};
-            while (copy.pop()) |completion| self.enqueue(completion);
+            while (copy.pop()) |completion| {
+                if (completion.linked) {
+                    if (copy.pop()) |completion2| {
+                        self.enqueueLinked(completion, completion2);
+                    }
+                } else {
+                    self.enqueue(completion);
+                }
+            }
         }
     }
 
@@ -174,12 +183,32 @@ const IO_Linux = struct {
         completion.prep(sqe);
     }
 
+    fn enqueueLinked(self: *IO, completion1: *Completion, completion2: *Completion) void {
+        const sqe1 = self.ring.get_sqe() catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.unqueued.push(completion1);
+                self.unqueued.push(completion2);
+                return;
+            },
+        };
+        const sqe2 = self.ring.get_sqe() catch |err| switch (err) {
+            error.SubmissionQueueFull => {
+                self.unqueued.push(completion1);
+                self.unqueued.push(completion2);
+                return;
+            },
+        };
+        completion1.prep(sqe1);
+        completion2.prep(sqe2);
+    }
+
     /// This struct holds the data needed for a single io_uring operation
     pub const Completion = struct {
         io: *IO,
         result: i32 = undefined,
         next: ?*Completion = null,
         operation: Operation,
+        linked: bool = false,
         // This is one of the usecases for c_void outside of C code and as such c_void will
         // be replaced with anyopaque eventually: https://github.com/ziglang/zig/issues/323
         context: ?*c_void,
@@ -212,6 +241,9 @@ const IO_Linux = struct {
                 },
                 .fsync => |op| {
                     linux.io_uring_prep_fsync(sqe, op.fd, op.flags);
+                },
+                .link_timeout => |*op| {
+                    io_uring_prep_link_timeout(sqe, &op.timespec, 0);
                 },
                 .openat => |op| {
                     linux.io_uring_prep_openat(sqe, op.fd, op.path, op.flags, op.mode);
@@ -246,6 +278,7 @@ const IO_Linux = struct {
                 },
             }
             sqe.user_data = @ptrToInt(completion);
+            if (completion.linked) sqe.flags |= linux.IOSQE_IO_LINK;
         }
 
         fn complete(completion: *Completion) void {
@@ -341,6 +374,18 @@ const IO_Linux = struct {
                         os.EROFS => error.ReadOnlyFileSystem,
                         else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
                     } else assert(completion.result == 0);
+                    completion.callback(completion.context, completion, &result);
+                },
+                .link_timeout => {
+                    const result = if (completion.result < 0) switch (-completion.result) {
+                        os.EINTR => {
+                            completion.io.enqueue(completion);
+                            return;
+                        },
+                        os.ECANCELED => error.Canceled,
+                        os.ETIME => {}, // A success.
+                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                    } else unreachable;
                     completion.callback(completion.context, completion, &result);
                 },
                 .openat => {
@@ -500,6 +545,17 @@ const IO_Linux = struct {
         }
     };
 
+    pub const LinkedCompletion = struct {
+        main_completion: Completion = undefined,
+        linked_completion: Completion = undefined,
+        main_result: ?union(enum) {
+            connect: ConnectError!void,
+            recv: RecvError!usize,
+            send: SendError!usize,
+        } = null,
+        linked_result: ?TimeoutError!void = null,
+    };
+
     /// This union encodes the set of operations supported as well as their arguments.
     const Operation = union(enum) {
         accept: struct {
@@ -521,6 +577,9 @@ const IO_Linux = struct {
         fsync: struct {
             fd: os.fd_t,
             flags: u32,
+        },
+        link_timeout: struct {
+            timespec: os.__kernel_timespec,
         },
         openat: struct {
             fd: os.fd_t,
@@ -775,6 +834,76 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub fn connectWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *LinkedCompletion,
+            result: ConnectError!void,
+        ) void,
+        completion: *LinkedCompletion,
+        socket: os.socket_t,
+        address: std.net.Address,
+        timeout_ns: u63,
+    ) void {
+        completion.main_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "main_completion", comp);
+                    linked_comp.main_result = .{
+                        .connect = @intToPtr(*const ConnectError!void, @ptrToInt(res)).*,
+                    };
+                    if (linked_comp.linked_result) |_| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            linked_comp.main_result.?.connect,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .connect = .{
+                    .socket = socket,
+                    .address = address,
+                },
+            },
+            .linked = true,
+        };
+        completion.linked_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            main_result.connect,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        completion.main_result = null;
+        completion.linked_result = null;
+        self.enqueueLinked(
+            &completion.main_completion,
+            &completion.linked_completion,
+        );
+    }
+
     pub const FsyncError = error{
         FileDescriptorInvalid,
         DiskQuota,
@@ -977,6 +1106,78 @@ const IO_Linux = struct {
         self.enqueue(completion);
     }
 
+    pub fn recvWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *LinkedCompletion,
+            result: RecvError!usize,
+        ) void,
+        completion: *LinkedCompletion,
+        socket: os.socket_t,
+        buffer: []u8,
+        recv_flags: u32,
+        timeout_ns: u63,
+    ) void {
+        completion.main_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "main_completion", comp);
+                    linked_comp.main_result = .{
+                        .recv = @intToPtr(*const RecvError!usize, @ptrToInt(res)).*,
+                    };
+                    if (linked_comp.linked_result) |_| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            linked_comp.main_result.?.recv,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .recv = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                    .flags = recv_flags,
+                },
+            },
+            .linked = true,
+        };
+        completion.linked_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            main_result.recv,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        completion.main_result = null;
+        completion.linked_result = null;
+        self.enqueueLinked(
+            &completion.main_completion,
+            &completion.linked_completion,
+        );
+    }
+
     pub const SendError = error{
         AccessDenied,
         WouldBlock,
@@ -1028,6 +1229,78 @@ const IO_Linux = struct {
             },
         };
         self.enqueue(completion);
+    }
+
+    pub fn sendWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *LinkedCompletion,
+            result: SendError!usize,
+        ) void,
+        completion: *LinkedCompletion,
+        socket: os.socket_t,
+        buffer: []const u8,
+        send_flags: u32,
+        timeout_ns: u63,
+    ) void {
+        completion.main_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "main_completion", comp);
+                    linked_comp.main_result = .{
+                        .send = @intToPtr(*const SendError!usize, @ptrToInt(res)).*,
+                    };
+                    if (linked_comp.linked_result) |_| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            linked_comp.main_result.?.send,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .send = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                    .flags = send_flags,
+                },
+            },
+            .linked = true,
+        };
+        completion.linked_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            main_result.send,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        completion.main_result = null;
+        completion.linked_result = null;
+        self.enqueueLinked(
+            &completion.main_completion,
+            &completion.linked_completion,
+        );
     }
 
     pub const TimeoutError = error{Canceled} || os.UnexpectedError;
@@ -1514,6 +1787,233 @@ test "accept/connect/receive/cancel" {
             result: IO.CancelError!void,
         ) void {
             result catch @panic("cancel error");
+            self.done = true;
+        }
+    }.run_test();
+}
+
+test "accept/connect/send/recvWithTimeout" {
+    const testing = std.testing;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        done: bool = false,
+        server: os.socket_t,
+        client: os.socket_t,
+
+        accepted_sock: os.socket_t = undefined,
+
+        send_buf: [10]u8 = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0, 1, 0 },
+        recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
+
+        sent: usize = 0,
+        received: usize = 0,
+        recv_callback_called: bool = false,
+
+        linked_completion: IO.LinkedCompletion = undefined,
+
+        fn run_test() !void {
+            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const kernel_backlog = 1;
+            const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(server);
+
+            const client = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(client);
+
+            try os.setsockopt(
+                server,
+                os.SOL_SOCKET,
+                os.SO_REUSEADDR,
+                &std.mem.toBytes(@as(c_int, 1)),
+            );
+            try os.bind(server, &address.any, address.getOsSockLen());
+            try os.listen(server, kernel_backlog);
+
+            var self: Context = .{
+                .io = try IO.init(32, 0),
+                .server = server,
+                .client = client,
+            };
+            defer self.io.deinit();
+
+            var client_completion: IO.Completion = undefined;
+            self.io.connect(
+                *Context,
+                &self,
+                connect_callback,
+                &client_completion,
+                client,
+                address,
+            );
+
+            var server_completion: IO.Completion = undefined;
+            self.io.accept(*Context, &self, accept_callback, &server_completion, server, 0);
+
+            while (!self.done) try self.io.tick();
+
+            try testing.expectEqual(self.send_buf.len, self.sent);
+            try testing.expectEqual(self.recv_buf.len, self.received);
+
+            try testing.expectEqualSlices(u8, self.send_buf[0..self.received], &self.recv_buf);
+
+            try testing.expectError(error.Canceled, self.linked_completion.linked_result.?);
+        }
+
+        fn connect_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.ConnectError!void,
+        ) void {
+            result catch @panic("connect error");
+            self.io.send(
+                *Context,
+                self,
+                send_callback,
+                completion,
+                self.client,
+                &self.send_buf,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+            );
+        }
+
+        fn send_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.SendError!usize,
+        ) void {
+            self.sent = result catch @panic("send error");
+        }
+
+        fn accept_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.AcceptError!os.socket_t,
+        ) void {
+            self.accepted_sock = result catch @panic("accept error");
+            self.io.recvWithTimeout(
+                *Context,
+                self,
+                recv_callback,
+                &self.linked_completion,
+                self.accepted_sock,
+                &self.recv_buf,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                std.time.ns_per_ms,
+            );
+        }
+
+        fn recv_callback(
+            self: *Context,
+            completion: *IO.LinkedCompletion,
+            result: IO.RecvError!usize,
+        ) void {
+            self.received = result catch @panic("recv error");
+            self.done = true;
+        }
+    }.run_test();
+}
+
+test "accept/connect/recvWithTimeout" {
+    const testing = std.testing;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        done: bool = false,
+        server: os.socket_t,
+        client: os.socket_t,
+
+        accepted_sock: os.socket_t = undefined,
+
+        recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
+
+        recv_result: IO.RecvError!usize = undefined,
+        linked_completion: IO.LinkedCompletion = undefined,
+
+        fn run_test() !void {
+            const address = try std.net.Address.parseIp4("127.0.0.1", 3133);
+            const kernel_backlog = 1;
+            const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(server);
+
+            const client = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(client);
+
+            try os.setsockopt(
+                server,
+                os.SOL_SOCKET,
+                os.SO_REUSEADDR,
+                &std.mem.toBytes(@as(c_int, 1)),
+            );
+            try os.bind(server, &address.any, address.getOsSockLen());
+            try os.listen(server, kernel_backlog);
+
+            var self: Context = .{
+                .io = try IO.init(32, 0),
+                .server = server,
+                .client = client,
+            };
+            defer self.io.deinit();
+
+            var client_completion: IO.Completion = undefined;
+            self.io.connect(
+                *Context,
+                &self,
+                connect_callback,
+                &client_completion,
+                client,
+                address,
+            );
+
+            var server_completion: IO.Completion = undefined;
+            self.io.accept(*Context, &self, accept_callback, &server_completion, server, 0);
+
+            while (!self.done) try self.io.tick();
+
+            try testing.expectError(error.Canceled, self.recv_result);
+
+            if (self.linked_completion.linked_result.?) |_| {} else |err| {
+                std.debug.print("linked_result expect no error, fount error.{s}\n", .{@errorName(err)});
+                return error.TestExpectedError;
+            }
+        }
+
+        fn connect_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.ConnectError!void,
+        ) void {
+            result catch @panic("connect error");
+            self.io.recvWithTimeout(
+                *Context,
+                self,
+                recv_callback,
+                &self.linked_completion,
+                self.client,
+                &self.recv_buf,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                std.time.ns_per_ms,
+            );
+        }
+
+        fn accept_callback(
+            self: *Context,
+            completion: *IO.Completion,
+            result: IO.AcceptError!os.socket_t,
+        ) void {
+            self.accepted_sock = result catch @panic("accept error");
+        }
+
+        fn recv_callback(
+            self: *Context,
+            completion: *IO.LinkedCompletion,
+            result: IO.RecvError!usize,
+        ) void {
+            self.recv_result = result;
             self.done = true;
         }
     }.run_test();
