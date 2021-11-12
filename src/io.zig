@@ -548,13 +548,12 @@ const IO_Linux = struct {
     pub const LinkedCompletion = struct {
         main_completion: Completion = undefined,
         linked_completion: Completion = undefined,
-        main_completion_done: bool = false,
-        linked_completion_done: bool = false,
-        main_result: union(enum) {
+        main_result: ?union(enum) {
             connect: ConnectError!void,
             recv: RecvError!usize,
             send: SendError!usize,
-        } = undefined,
+        } = null,
+        linked_result: ?TimeoutError!void = null,
     };
 
     /// This union encodes the set of operations supported as well as their arguments.
@@ -858,12 +857,11 @@ const IO_Linux = struct {
                     linked_comp.main_result = .{
                         .connect = @intToPtr(*const ConnectError!void, @ptrToInt(res)).*,
                     };
-                    linked_comp.main_completion_done = true;
-                    if (linked_comp.linked_completion_done) {
+                    if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
                             comp,
-                            linked_comp.main_result.connect,
+                            linked_comp.main_result.?.connect,
                         );
                     }
                 }
@@ -882,12 +880,12 @@ const IO_Linux = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
                     const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
-                    linked_comp.linked_completion_done = true;
-                    if (linked_comp.main_completion_done) {
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
                             comp,
-                            linked_comp.main_result.connect,
+                            main_result.connect,
                         );
                     }
                 }
@@ -898,8 +896,8 @@ const IO_Linux = struct {
                 },
             },
         };
-        completion.main_completion_done = false;
-        completion.linked_completion_done = false;
+        completion.main_result = null;
+        completion.linked_result = null;
         self.enqueueLinked(
             &completion.main_completion,
             &completion.linked_completion,
@@ -1132,12 +1130,11 @@ const IO_Linux = struct {
                     linked_comp.main_result = .{
                         .recv = @intToPtr(*const RecvError!usize, @ptrToInt(res)).*,
                     };
-                    linked_comp.main_completion_done = true;
-                    if (linked_comp.linked_completion_done) {
+                    if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
                             comp,
-                            linked_comp.main_result.recv,
+                            linked_comp.main_result.?.recv,
                         );
                     }
                 }
@@ -1157,12 +1154,12 @@ const IO_Linux = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
                     const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
-                    linked_comp.linked_completion_done = true;
-                    if (linked_comp.main_completion_done) {
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
                             comp,
-                            linked_comp.main_result.recv,
+                            main_result.recv,
                         );
                     }
                 }
@@ -1173,8 +1170,8 @@ const IO_Linux = struct {
                 },
             },
         };
-        completion.main_completion_done = false;
-        completion.linked_completion_done = false;
+        completion.main_result = null;
+        completion.linked_result = null;
         self.enqueueLinked(
             &completion.main_completion,
             &completion.linked_completion,
@@ -1258,12 +1255,11 @@ const IO_Linux = struct {
                     linked_comp.main_result = .{
                         .send = @intToPtr(*const SendError!usize, @ptrToInt(res)).*,
                     };
-                    linked_comp.main_completion_done = true;
-                    if (linked_comp.linked_completion_done) {
+                    if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
                             comp,
-                            linked_comp.main_result.send,
+                            linked_comp.main_result.?.send,
                         );
                     }
                 }
@@ -1283,12 +1279,12 @@ const IO_Linux = struct {
             .callback = struct {
                 fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
                     const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
-                    linked_comp.linked_completion_done = true;
-                    if (linked_comp.main_completion_done) {
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
                             comp,
-                            linked_comp.main_result.send,
+                            main_result.send,
                         );
                     }
                 }
@@ -1299,8 +1295,8 @@ const IO_Linux = struct {
                 },
             },
         };
-        completion.main_completion_done = false;
-        completion.linked_completion_done = false;
+        completion.main_result = null;
+        completion.linked_result = null;
         self.enqueueLinked(
             &completion.main_completion,
             &completion.linked_completion,
