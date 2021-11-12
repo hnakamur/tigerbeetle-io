@@ -840,7 +840,7 @@ const IO_Linux = struct {
         context: Context,
         comptime callback: fn (
             context: Context,
-            completion: *Completion,
+            completion: *LinkedCompletion,
             result: ConnectError!void,
         ) void,
         completion: *LinkedCompletion,
@@ -860,7 +860,7 @@ const IO_Linux = struct {
                     if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
-                            comp,
+                            linked_comp,
                             linked_comp.main_result.?.connect,
                         );
                     }
@@ -884,7 +884,7 @@ const IO_Linux = struct {
                     if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
-                            comp,
+                            linked_comp,
                             main_result.connect,
                         );
                     }
@@ -1112,7 +1112,7 @@ const IO_Linux = struct {
         context: Context,
         comptime callback: fn (
             context: Context,
-            completion: *Completion,
+            completion: *LinkedCompletion,
             result: RecvError!usize,
         ) void,
         completion: *LinkedCompletion,
@@ -1133,7 +1133,7 @@ const IO_Linux = struct {
                     if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
-                            comp,
+                            linked_comp,
                             linked_comp.main_result.?.recv,
                         );
                     }
@@ -1158,7 +1158,7 @@ const IO_Linux = struct {
                     if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
-                            comp,
+                            linked_comp,
                             main_result.recv,
                         );
                     }
@@ -1237,7 +1237,7 @@ const IO_Linux = struct {
         context: Context,
         comptime callback: fn (
             context: Context,
-            completion: *Completion,
+            completion: *LinkedCompletion,
             result: SendError!usize,
         ) void,
         completion: *LinkedCompletion,
@@ -1258,7 +1258,7 @@ const IO_Linux = struct {
                     if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
-                            comp,
+                            linked_comp,
                             linked_comp.main_result.?.send,
                         );
                     }
@@ -1283,7 +1283,7 @@ const IO_Linux = struct {
                     if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
-                            comp,
+                            linked_comp,
                             main_result.send,
                         );
                     }
@@ -1858,6 +1858,8 @@ test "accept/connect/send/recvWithTimeout" {
             try testing.expectEqual(self.recv_buf.len, self.received);
 
             try testing.expectEqualSlices(u8, self.send_buf[0..self.received], &self.recv_buf);
+
+            try testing.expectError(error.Canceled, self.linked_completion.linked_result.?);
         }
 
         fn connect_callback(
@@ -1905,7 +1907,7 @@ test "accept/connect/send/recvWithTimeout" {
 
         fn recv_callback(
             self: *Context,
-            completion: *IO.Completion,
+            completion: *IO.LinkedCompletion,
             result: IO.RecvError!usize,
         ) void {
             self.received = result catch @panic("recv error");
@@ -1973,6 +1975,11 @@ test "accept/connect/recvWithTimeout" {
             while (!self.done) try self.io.tick();
 
             try testing.expectError(error.Canceled, self.recv_result);
+
+            if (self.linked_completion.linked_result.?) |_| {} else |err| {
+                std.debug.print("linked_result expect no error, fount error.{s}\n", .{@errorName(err)});
+                return error.TestExpectedError;
+            }
         }
 
         fn connect_callback(
@@ -2003,7 +2010,7 @@ test "accept/connect/recvWithTimeout" {
 
         fn recv_callback(
             self: *Context,
-            completion: *IO.Completion,
+            completion: *IO.LinkedCompletion,
             result: IO.RecvError!usize,
         ) void {
             self.recv_result = result;
