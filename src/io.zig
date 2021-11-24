@@ -1233,6 +1233,78 @@ const IO_Linux = struct {
         );
     }
 
+    pub fn recvmsgWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *LinkedCompletion,
+            result: RecvError!usize,
+        ) void,
+        completion: *LinkedCompletion,
+        socket: os.socket_t,
+        msg: *os.msghdr,
+        recv_flags: u32,
+        timeout_ns: u63,
+    ) void {
+        completion.main_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "main_completion", comp);
+                    linked_comp.main_result = .{
+                        .recv = @intToPtr(*const RecvError!usize, @ptrToInt(res)).*,
+                    };
+                    if (linked_comp.linked_result) |_| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            linked_comp.main_result.?.recv,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .recvmsg = .{
+                    .socket = socket,
+                    .msg = msg,
+                    .flags = recv_flags,
+                },
+            },
+            .linked = true,
+        };
+        completion.linked_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            main_result.recv,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        completion.main_result = null;
+        completion.linked_result = null;
+        self.enqueueLinked(
+            &completion.main_completion,
+            &completion.linked_completion,
+        );
+    }
+
     pub const SendError = error{
         AccessDenied,
         WouldBlock,
@@ -1360,6 +1432,78 @@ const IO_Linux = struct {
                 .send = .{
                     .socket = socket,
                     .buffer = buffer,
+                    .flags = send_flags,
+                },
+            },
+            .linked = true,
+        };
+        completion.linked_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
+                    linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    if (linked_comp.main_result) |main_result| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            main_result.send,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .link_timeout = .{
+                    .timespec = .{ .tv_sec = 0, .tv_nsec = timeout_ns },
+                },
+            },
+        };
+        completion.main_result = null;
+        completion.linked_result = null;
+        self.enqueueLinked(
+            &completion.main_completion,
+            &completion.linked_completion,
+        );
+    }
+
+    pub fn sendmsgWithTimeout(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *LinkedCompletion,
+            result: SendError!usize,
+        ) void,
+        completion: *LinkedCompletion,
+        socket: os.socket_t,
+        msg: *const os.msghdr_const,
+        send_flags: u32,
+        timeout_ns: u63,
+    ) void {
+        completion.main_completion = .{
+            .io = self,
+            .context = context,
+            .callback = struct {
+                fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
+                    const linked_comp = @fieldParentPtr(LinkedCompletion, "main_completion", comp);
+                    linked_comp.main_result = .{
+                        .send = @intToPtr(*const SendError!usize, @ptrToInt(res)).*,
+                    };
+                    if (linked_comp.linked_result) |_| {
+                        callback(
+                            @intToPtr(Context, @ptrToInt(ctx)),
+                            linked_comp,
+                            linked_comp.main_result.?.send,
+                        );
+                    }
+                }
+            }.wrapper,
+            .operation = .{
+                .sendmsg = .{
+                    .socket = socket,
+                    .msg = msg,
                     .flags = send_flags,
                 },
             },
@@ -1916,6 +2060,162 @@ test "accept/connect/sendmsg/recvmsg" {
         fn recv_callback(
             self: *Context,
             completion: *IO.Completion,
+            result: IO.RecvError!usize,
+        ) void {
+            self.received = result catch @panic("recv error");
+            self.done = true;
+        }
+    }.run_test();
+}
+
+test "accept/connect/sendmsgWithTimeout/recvmsgWithTimeout" {
+    const testing = std.testing;
+
+    try struct {
+        const Context = @This();
+
+        io: IO,
+        done: bool = false,
+        server: os.socket_t,
+        client: os.socket_t,
+
+        accepted_sock: os.socket_t = undefined,
+
+        send_buf: [10]u8 = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0, 1, 0 },
+        recv_buf: [5]u8 = [_]u8{ 0, 1, 0, 1, 0 },
+
+        send_iovecs: ?[1]os.iovec_const = null,
+        recv_iovecs: ?[1]os.iovec = null,
+
+        send_msg: ?os.msghdr_const = null,
+        recv_msg: ?os.msghdr = null,
+        recv_addr: std.net.Address = undefined,
+
+        sent: usize = 0,
+        received: usize = 0,
+
+        fn run_test() !void {
+            const address = try std.net.Address.parseIp4("127.0.0.1", 3131);
+            const kernel_backlog = 1;
+            const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(server);
+
+            const client = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
+            defer os.close(client);
+
+            try os.setsockopt(
+                server,
+                os.SOL_SOCKET,
+                os.SO_REUSEADDR,
+                &std.mem.toBytes(@as(c_int, 1)),
+            );
+            try os.bind(server, &address.any, address.getOsSockLen());
+            try os.listen(server, kernel_backlog);
+
+            var self: Context = .{
+                .io = try IO.init(32, 0),
+                .server = server,
+                .client = client,
+            };
+            defer self.io.deinit();
+
+            self.send_iovecs = [_]os.iovec_const{
+                os.iovec_const{ .iov_base = &self.send_buf, .iov_len = self.send_buf.len },
+            };
+            self.send_msg = os.msghdr_const{
+                .msg_name = &address.any,
+                .msg_namelen = address.getOsSockLen(),
+                .msg_iov = &self.send_iovecs.?,
+                .msg_iovlen = 1,
+                .msg_control = null,
+                .msg_controllen = 0,
+                .msg_flags = 0,
+            };
+
+            self.recv_iovecs = [_]os.iovec{
+                os.iovec{ .iov_base = &self.recv_buf, .iov_len = self.recv_buf.len },
+            };
+            self.recv_addr = std.net.Address.initIp4([_]u8{0} ** 4, 0);
+            self.recv_msg = os.msghdr{
+                .msg_name = &self.recv_addr.any,
+                .msg_namelen = self.recv_addr.getOsSockLen(),
+                .msg_iov = &self.recv_iovecs.?,
+                .msg_iovlen = 1,
+                .msg_control = null,
+                .msg_controllen = 0,
+                .msg_flags = 0,
+            };
+
+            var client_completion: IO.LinkedCompletion = undefined;
+            self.io.connectWithTimeout(
+                *Context,
+                &self,
+                connect_callback,
+                &client_completion,
+                client,
+                address,
+                5 * std.time.ns_per_s,
+            );
+
+            var server_completion: IO.LinkedCompletion = undefined;
+            self.io.accept(*Context, &self, accept_callback, &server_completion.main_completion, server, 0);
+
+            while (!self.done) try self.io.tick();
+
+            try testing.expectEqual(self.send_buf.len, self.sent);
+            try testing.expectEqual(self.recv_buf.len, self.received);
+
+            try testing.expectEqualSlices(u8, self.send_buf[0..self.received], &self.recv_buf);
+        }
+
+        fn connect_callback(
+            self: *Context,
+            completion: *IO.LinkedCompletion,
+            result: IO.ConnectError!void,
+        ) void {
+            result catch @panic("connect error");
+            self.io.sendmsgWithTimeout(
+                *Context,
+                self,
+                send_callback,
+                completion,
+                self.client,
+                &self.send_msg.?,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                5 * std.time.ns_per_s,
+            );
+        }
+
+        fn send_callback(
+            self: *Context,
+            completion: *IO.LinkedCompletion,
+            result: IO.SendError!usize,
+        ) void {
+            self.sent = result catch @panic("send error");
+        }
+
+        fn accept_callback(
+            self: *Context,
+            main_completion: *IO.Completion,
+            result: IO.AcceptError!os.socket_t,
+        ) void {
+            self.accepted_sock = result catch @panic("accept error");
+            const comp = @fieldParentPtr(IO.LinkedCompletion, "main_completion", main_completion);
+            self.io.recvmsgWithTimeout(
+                *Context,
+                self,
+                recv_callback,
+                comp,
+                self.accepted_sock,
+                &self.recv_msg.?,
+                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                5 * std.time.ns_per_s,
+            );
+        }
+
+        fn recv_callback(
+            self: *Context,
+            completion: *IO.LinkedCompletion,
             result: IO.RecvError!usize,
         ) void {
             self.received = result catch @panic("recv error");
