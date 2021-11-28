@@ -9,6 +9,8 @@ const io_uring_prep_link_timeout = @import("link_timeout.zig").io_uring_prep_lin
 const io_uring_prep_recvmsg = @import("sendmsg.zig").io_uring_prep_recvmsg;
 const io_uring_prep_sendmsg = @import("sendmsg.zig").io_uring_prep_sendmsg;
 
+const tigerbeetle_io_log = std.log.scoped(.@"tigerbeetle-io");
+
 const FIFO = @import("fifo.zig").FIFO;
 const IO_Darwin = @import("io_darwin.zig").IO;
 
@@ -145,6 +147,7 @@ const IO_Linux = struct {
                     if (-cqe.res == os.ETIME) etime.* = true;
                     continue;
                 }
+                tigerbeetle_io_log.debug("flush_completion, cqe.user_data=0x{x}, res={}", .{ cqe.user_data, cqe.res });
                 const completion = @intToPtr(*Completion, @intCast(usize, cqe.user_data));
                 completion.result = cqe.res;
                 // We do not run the completion here (instead appending to a linked list) to avoid:
@@ -286,6 +289,7 @@ const IO_Linux = struct {
                 },
             }
             sqe.user_data = @ptrToInt(completion);
+            tigerbeetle_io_log.debug("sqe.user_data=0x{x}, operation tagname={s}", .{ sqe.user_data, @tagName(completion.operation) });
             if (completion.linked) sqe.flags |= linux.IOSQE_IO_LINK;
         }
 
@@ -387,6 +391,9 @@ const IO_Linux = struct {
                 .link_timeout => {
                     const result = if (completion.result < 0) switch (-completion.result) {
                         os.EINTR => {
+                            // TODO: maybe we should enqueue the linked target completion
+                            // just before this with linked field being set to true.
+                            tigerbeetle_io_log.debug("Completion.complete 0x{x} op={s} got EINTR calling enqueue", .{ @ptrToInt(completion), @tagName(completion.operation) });
                             completion.io.enqueue(completion);
                             return;
                         },
@@ -474,6 +481,7 @@ const IO_Linux = struct {
                 .send, .sendmsg => {
                     const result = if (completion.result < 0) switch (-completion.result) {
                         os.EINTR => {
+                            tigerbeetle_io_log.debug("Completion.complete 0x{x} op={s} got EINTR calling enqueue", .{ @ptrToInt(completion), @tagName(completion.operation) });
                             completion.io.enqueue(completion);
                             return;
                         },
@@ -875,6 +883,7 @@ const IO_Linux = struct {
                     linked_comp.main_result = .{
                         .connect = @intToPtr(*const ConnectError!void, @ptrToInt(res)).*,
                     };
+                    tigerbeetle_io_log.debug("IO.connectWithTimeout, connect result={}", .{linked_comp.main_result.?.connect});
                     if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
@@ -899,6 +908,7 @@ const IO_Linux = struct {
                 fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
                     const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
                     linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    tigerbeetle_io_log.debug("IO.connectWithTimeout, link_timeout result={}", .{linked_comp.linked_result.?});
                     if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
@@ -1185,6 +1195,7 @@ const IO_Linux = struct {
                     linked_comp.main_result = .{
                         .recv = @intToPtr(*const RecvError!usize, @ptrToInt(res)).*,
                     };
+                    tigerbeetle_io_log.debug("IO.recvWithTimeout comp=0x{x}, main_result={}", .{ @ptrToInt(comp), linked_comp.main_result.?.recv });
                     if (linked_comp.linked_result) |_| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
@@ -1210,6 +1221,7 @@ const IO_Linux = struct {
                 fn wrapper(ctx: ?*c_void, comp: *Completion, res: *const c_void) void {
                     const linked_comp = @fieldParentPtr(LinkedCompletion, "linked_completion", comp);
                     linked_comp.linked_result = @intToPtr(*const TimeoutError!void, @ptrToInt(res)).*;
+                    tigerbeetle_io_log.debug("IO.recvWithTimeout comp=0x{x}, linked_result={}", .{ @ptrToInt(comp), linked_comp.linked_result.? });
                     if (linked_comp.main_result) |main_result| {
                         callback(
                             @intToPtr(Context, @ptrToInt(ctx)),
