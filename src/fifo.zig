@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const tigerbeetle_io_log = std.log.scoped(.@"tigerbeetle-io");
 
 /// An intrusive first in/first out linked list.
 /// The element type T must have a field called "next" of type ?*T
@@ -11,6 +12,9 @@ pub fn FIFO(comptime T: type) type {
         out: ?*T = null,
 
         pub fn push(self: *Self, elem: *T) void {
+            if (elem.next != null) {
+                tigerbeetle_io_log.err("elem.next != null for elem=0x{x}", .{@ptrToInt(elem)});
+            }
             assert(elem.next == null);
             if (self.in) |in| {
                 in.next = elem;
