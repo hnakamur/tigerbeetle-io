@@ -9,12 +9,13 @@ const io_uring_prep_link_timeout = @import("link_timeout.zig").io_uring_prep_lin
 const io_uring_prep_recvmsg = @import("sendmsg.zig").io_uring_prep_recvmsg;
 const io_uring_prep_sendmsg = @import("sendmsg.zig").io_uring_prep_sendmsg;
 
-// const tigerbeetle_io_log = std.log.scoped(.@"tigerbeetle-io");
-const tigerbeetle_io_log = struct {
-    pub fn debug(
-        comptime format: []const u8,
-        args: anytype,
-    ) void {}
+const tigerbeetle_io_log = if (false) std.log.scoped(.@"tigerbeetle-io") else blk: {
+    break :blk struct {
+        pub fn debug(
+            comptime format: []const u8,
+            args: anytype,
+        ) void {}
+    };
 };
 
 const FIFO = @import("fifo.zig").FIFO;
