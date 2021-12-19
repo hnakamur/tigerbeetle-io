@@ -35,7 +35,7 @@ pub fn io_uring_prep_recvmsg(
     msg: *os.msghdr,
     flags: u32,
 ) void {
-    linux.io_uring_prep_rw(.RECVMSG, sqe, fd, msg, 1, 0);
+    linux.io_uring_prep_rw(.RECVMSG, sqe, fd, @ptrToInt(msg), 1, 0);
     sqe.rw_flags = flags;
 }
 
@@ -45,7 +45,7 @@ pub fn io_uring_prep_sendmsg(
     msg: *const os.msghdr_const,
     flags: u32,
 ) void {
-    linux.io_uring_prep_rw(.SENDMSG, sqe, fd, msg, 1, 0);
+    linux.io_uring_prep_rw(.SENDMSG, sqe, fd, @ptrToInt(msg), 1, 0);
     sqe.rw_flags = flags;
 }
 
