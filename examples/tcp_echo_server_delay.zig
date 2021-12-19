@@ -11,10 +11,10 @@ const ClientHandler = struct {
     delay_ns: u63,
     recv_buf: []u8,
     received: usize = 0,
-    allocator: *mem.Allocator,
+    allocator: mem.Allocator,
     completion: IO.Completion,
 
-    fn init(allocator: *mem.Allocator, io: *IO, sock: os.socket_t, delay_ns: u63) !*ClientHandler {
+    fn init(allocator: mem.Allocator, io: *IO, sock: os.socket_t, delay_ns: u63) !*ClientHandler {
         var buf = try allocator.alloc(u8, 1024);
         var self = try allocator.create(ClientHandler);
         self.* = ClientHandler{
@@ -113,9 +113,9 @@ const Server = struct {
     io: IO,
     server: os.socket_t,
     delay_ns: u63,
-    allocator: *mem.Allocator,
+    allocator: mem.Allocator,
 
-    fn init(allocator: *mem.Allocator, address: std.net.Address, delay_ns: u63) !Server {
+    fn init(allocator: mem.Allocator, address: std.net.Address, delay_ns: u63) !Server {
         const kernel_backlog = 1;
         const server = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
 

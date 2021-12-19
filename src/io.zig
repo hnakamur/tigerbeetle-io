@@ -1,11 +1,11 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const builtin = @import("builtin");
 const os = std.os;
 const linux = os.linux;
 const IO_Uring = linux.IO_Uring;
 const io_uring_cqe = linux.io_uring_cqe;
 const io_uring_sqe = linux.io_uring_sqe;
-const io_uring_prep_link_timeout = @import("link_timeout.zig").io_uring_prep_link_timeout;
 const io_uring_prep_recvmsg = @import("sendmsg.zig").io_uring_prep_recvmsg;
 const io_uring_prep_sendmsg = @import("sendmsg.zig").io_uring_prep_sendmsg;
 
@@ -14,14 +14,17 @@ const tigerbeetle_io_log = if (false) std.log.scoped(.@"tigerbeetle-io") else bl
         pub fn debug(
             comptime format: []const u8,
             args: anytype,
-        ) void {}
+        ) void {
+            _ = format;
+            _ = args;
+        }
     };
 };
 
 const FIFO = @import("fifo.zig").FIFO;
 const IO_Darwin = @import("io_darwin.zig").IO;
 
-pub const IO = switch (std.Target.current.os.tag) {
+pub const IO = switch (builtin.target.os.tag) {
     .linux => IO_Linux,
     .macos, .tvos, .watchos, .ios => IO_Darwin,
     else => @compileError("IO is not supported for platform"),
@@ -151,7 +154,7 @@ const IO_Linux = struct {
                     // it was completed due to the completion of an event, in which case `cqe.res`
                     // would be 0. It is possible for multiple timeout operations to complete at the
                     // same time if the nanoseconds value passed to `run_for_ns()` is very short.
-                    if (-cqe.res == os.ETIME) etime.* = true;
+                    if (-cqe.res == @enumToInt(os.E.TIME)) etime.* = true;
                     continue;
                 }
                 tigerbeetle_io_log.debug("flush_completion, cqe.user_data=0x{x}, res={}", .{ cqe.user_data, cqe.res });
@@ -226,6 +229,13 @@ const IO_Linux = struct {
         context: ?*c_void,
         callback: fn (context: ?*c_void, completion: *Completion, result: *const c_void) void,
 
+        pub fn err(self: *const Completion) os.E {
+            if (self.result > -4096 and self.result < 0) {
+                return @intToEnum(os.E, -self.result);
+            }
+            return .SUCCESS;
+        }
+
         fn prep(completion: *Completion, sqe: *io_uring_sqe) void {
             switch (completion.operation) {
                 .accept => |*op| {
@@ -255,7 +265,7 @@ const IO_Linux = struct {
                     linux.io_uring_prep_fsync(sqe, op.fd, op.flags);
                 },
                 .link_timeout => |*op| {
-                    io_uring_prep_link_timeout(sqe, &op.timespec, 0);
+                    linux.io_uring_prep_link_timeout(sqe, &op.timespec, 0);
                 },
                 .openat => |op| {
                     linux.io_uring_prep_openat(sqe, op.fd, op.path, op.flags, op.mode);
@@ -303,264 +313,264 @@ const IO_Linux = struct {
         fn complete(completion: *Completion) void {
             switch (completion.operation) {
                 .accept => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECANCELED => error.Canceled,
-                        os.ECONNABORTED => error.ConnectionAborted,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => error.SocketNotListening,
-                        os.EMFILE => error.ProcessFdQuotaExceeded,
-                        os.ENFILE => error.SystemFdQuotaExceeded,
-                        os.ENOBUFS => error.SystemResources,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.EOPNOTSUPP => error.OperationNotSupported,
-                        os.EPERM => error.PermissionDenied,
-                        os.EPROTO => error.ProtocolFailure,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.AGAIN => error.Again,
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.CONNABORTED => error.ConnectionAborted,
+                        os.E.FAULT => unreachable,
+                        os.E.INVAL => error.SocketNotListening,
+                        os.E.MFILE => error.ProcessFdQuotaExceeded,
+                        os.E.NFILE => error.SystemFdQuotaExceeded,
+                        os.E.NOBUFS => error.SystemResources,
+                        os.E.NOMEM => error.SystemResources,
+                        os.E.NOTSOCK => error.FileDescriptorNotASocket,
+                        os.E.OPNOTSUPP => error.OperationNotSupported,
+                        os.E.PERM => error.PermissionDenied,
+                        os.E.PROTO => error.ProtocolFailure,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else @intCast(os.socket_t, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
-                .cancel => |*op| {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                .cancel => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EALREADY => error.AlreadyInProgress,
-                        os.ENOENT => error.NotFound,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.ALREADY => error.AlreadyInProgress,
+                        os.E.NOENT => error.NotFound,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else assert(completion.result == 0);
                     completion.callback(completion.context, completion, &result);
                 },
                 .close => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECANCELED => error.Canceled,
-                        os.EDQUOT => error.DiskQuota,
-                        os.EIO => error.InputOutput,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {}, // A success, see https://github.com/ziglang/zig/issues/2425
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.DQUOT => error.DiskQuota,
+                        os.E.IO => error.InputOutput,
+                        os.E.NOSPC => error.NoSpaceLeft,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else assert(completion.result == 0);
                     completion.callback(completion.context, completion, &result);
                 },
                 .connect => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EACCES => error.AccessDenied,
-                        os.EADDRINUSE => error.AddressInUse,
-                        os.EADDRNOTAVAIL => error.AddressNotAvailable,
-                        os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
-                        os.EAGAIN, os.EINPROGRESS => error.WouldBlock,
-                        os.EALREADY => error.OpenAlreadyInProgress,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECANCELED => error.Canceled,
-                        os.ECONNREFUSED => error.ConnectionRefused,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        os.EFAULT => unreachable,
-                        os.EISCONN => error.AlreadyConnected,
-                        os.ENETUNREACH => error.NetworkUnreachable,
-                        os.ENOENT => error.FileNotFound,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.EPERM => error.PermissionDenied,
-                        os.EPROTOTYPE => error.ProtocolNotSupported,
-                        os.ETIMEDOUT => error.ConnectionTimedOut,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.ACCES => error.AccessDenied,
+                        os.E.ADDRINUSE => error.AddressInUse,
+                        os.E.ADDRNOTAVAIL => error.AddressNotAvailable,
+                        os.E.AFNOSUPPORT => error.AddressFamilyNotSupported,
+                        os.E.AGAIN, os.E.INPROGRESS => error.Again,
+                        os.E.ALREADY => error.OpenAlreadyInProgress,
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.CONNREFUSED => error.ConnectionRefused,
+                        os.E.CONNRESET => error.ConnectionResetByPeer,
+                        os.E.FAULT => unreachable,
+                        os.E.ISCONN => error.AlreadyConnected,
+                        os.E.NETUNREACH => error.NetworkUnreachable,
+                        os.E.NOENT => error.FileNotFound,
+                        os.E.NOTSOCK => error.FileDescriptorNotASocket,
+                        os.E.PERM => error.PermissionDenied,
+                        os.E.PROTOTYPE => error.ProtocolNotSupported,
+                        os.E.TIMEDOUT => error.ConnectionTimedOut,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else assert(completion.result == 0);
                     completion.callback(completion.context, completion, &result);
                 },
                 .fsync => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECANCELED => error.Canceled,
-                        os.EDQUOT => error.DiskQuota,
-                        os.EINVAL => error.ArgumentsInvalid,
-                        os.EIO => error.InputOutput,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        os.EROFS => error.ReadOnlyFileSystem,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.DQUOT => error.DiskQuota,
+                        os.E.INVAL => error.ArgumentsInvalid,
+                        os.E.IO => error.InputOutput,
+                        os.E.NOSPC => error.NoSpaceLeft,
+                        os.E.ROFS => error.ReadOnlyFileSystem,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else assert(completion.result == 0);
                     completion.callback(completion.context, completion, &result);
                 },
                 .link_timeout => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             // TODO: maybe we should enqueue the linked target completion
                             // just before this with linked field being set to true.
                             tigerbeetle_io_log.debug("Completion.complete 0x{x} op={s} got EINTR calling enqueue", .{ @ptrToInt(completion), @tagName(completion.operation) });
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.ECANCELED => error.Canceled,
-                        os.ETIME => {}, // A success.
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.CANCELED => error.Canceled,
+                        os.E.TIME => {}, // A success.
+                        else => |errno| os.unexpectedErrno(errno),
                     } else unreachable;
                     completion.callback(completion.context, completion, &result);
                 },
                 .openat => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EACCES => error.AccessDenied,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.EBUSY => error.DeviceBusy,
-                        os.ECANCELED => error.Canceled,
-                        os.EEXIST => error.PathAlreadyExists,
-                        os.EFAULT => unreachable,
-                        os.EFBIG => error.FileTooBig,
-                        os.EINVAL => error.ArgumentsInvalid,
-                        os.EISDIR => error.IsDir,
-                        os.ELOOP => error.SymLinkLoop,
-                        os.EMFILE => error.ProcessFdQuotaExceeded,
-                        os.ENAMETOOLONG => error.NameTooLong,
-                        os.ENFILE => error.SystemFdQuotaExceeded,
-                        os.ENODEV => error.NoDevice,
-                        os.ENOENT => error.FileNotFound,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        os.ENOTDIR => error.NotDir,
-                        os.EOPNOTSUPP => error.FileLocksNotSupported,
-                        os.EOVERFLOW => error.FileTooBig,
-                        os.EPERM => error.AccessDenied,
-                        os.EWOULDBLOCK => error.WouldBlock,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.ACCES => error.AccessDenied,
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.BUSY => error.DeviceBusy,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.EXIST => error.PathAlreadyExists,
+                        os.E.FAULT => unreachable,
+                        os.E.FBIG => error.FileTooBig,
+                        os.E.INVAL => error.ArgumentsInvalid,
+                        os.E.ISDIR => error.IsDir,
+                        os.E.LOOP => error.SymLinkLoop,
+                        os.E.MFILE => error.ProcessFdQuotaExceeded,
+                        os.E.NAMETOOLONG => error.NameTooLong,
+                        os.E.NFILE => error.SystemFdQuotaExceeded,
+                        os.E.NODEV => error.NoDevice,
+                        os.E.NOENT => error.FileNotFound,
+                        os.E.NOMEM => error.SystemResources,
+                        os.E.NOSPC => error.NoSpaceLeft,
+                        os.E.NOTDIR => error.NotDir,
+                        os.E.OPNOTSUPP => error.FileLocksNotSupported,
+                        os.E.OVERFLOW => error.FileTooBig,
+                        os.E.PERM => error.AccessDenied,
+                        os.E.AGAIN => error.Again,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else @intCast(os.fd_t, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
                 .read => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.NotOpenForReading,
-                        os.ECANCELED => error.Canceled,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => error.Alignment,
-                        os.EIO => error.InputOutput,
-                        os.EISDIR => error.IsDir,
-                        os.ENOBUFS => error.SystemResources,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENXIO => error.Unseekable,
-                        os.EOVERFLOW => error.Unseekable,
-                        os.ESPIPE => error.Unseekable,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.AGAIN => error.Again,
+                        os.E.BADF => error.NotOpenForReading,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.CONNRESET => error.ConnectionResetByPeer,
+                        os.E.FAULT => unreachable,
+                        os.E.INVAL => error.Alignment,
+                        os.E.IO => error.InputOutput,
+                        os.E.ISDIR => error.IsDir,
+                        os.E.NOBUFS => error.SystemResources,
+                        os.E.NOMEM => error.SystemResources,
+                        os.E.NXIO => error.Unseekable,
+                        os.E.OVERFLOW => error.Unseekable,
+                        os.E.SPIPE => error.Unseekable,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else @intCast(usize, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
                 .recv, .recvmsg => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECANCELED => error.Canceled,
-                        os.ECONNREFUSED => error.ConnectionRefused,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => unreachable,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOTCONN => error.SocketNotConnected,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.AGAIN => error.Again,
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.CONNREFUSED => error.ConnectionRefused,
+                        os.E.FAULT => unreachable,
+                        os.E.INVAL => unreachable,
+                        os.E.NOMEM => error.SystemResources,
+                        os.E.NOTCONN => error.SocketNotConnected,
+                        os.E.NOTSOCK => error.FileDescriptorNotASocket,
+                        os.E.CONNRESET => error.ConnectionResetByPeer,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else @intCast(usize, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
                 .send, .sendmsg => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             tigerbeetle_io_log.debug("Completion.complete 0x{x} op={s} got EINTR calling enqueue", .{ @ptrToInt(completion), @tagName(completion.operation) });
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EACCES => error.AccessDenied,
-                        os.EAGAIN => error.WouldBlock,
-                        os.EALREADY => error.FastOpenAlreadyInProgress,
-                        os.EAFNOSUPPORT => error.AddressFamilyNotSupported,
-                        os.EBADF => error.FileDescriptorInvalid,
-                        os.ECANCELED => error.Canceled,
-                        os.ECONNRESET => error.ConnectionResetByPeer,
-                        os.EDESTADDRREQ => unreachable,
-                        os.EFAULT => unreachable,
-                        os.EINVAL => unreachable,
-                        os.EISCONN => unreachable,
-                        os.EMSGSIZE => error.MessageTooBig,
-                        os.ENOBUFS => error.SystemResources,
-                        os.ENOMEM => error.SystemResources,
-                        os.ENOTCONN => error.SocketNotConnected,
-                        os.ENOTSOCK => error.FileDescriptorNotASocket,
-                        os.EOPNOTSUPP => error.OperationNotSupported,
-                        os.EPIPE => error.BrokenPipe,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.ACCES => error.AccessDenied,
+                        os.E.AGAIN => error.Again,
+                        os.E.ALREADY => error.FastOpenAlreadyInProgress,
+                        os.E.AFNOSUPPORT => error.AddressFamilyNotSupported,
+                        os.E.BADF => error.FileDescriptorInvalid,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.CONNRESET => error.ConnectionResetByPeer,
+                        os.E.DESTADDRREQ => unreachable,
+                        os.E.FAULT => unreachable,
+                        os.E.INVAL => unreachable,
+                        os.E.ISCONN => unreachable,
+                        os.E.MSGSIZE => error.MessageTooBig,
+                        os.E.NOBUFS => error.SystemResources,
+                        os.E.NOMEM => error.SystemResources,
+                        os.E.NOTCONN => error.SocketNotConnected,
+                        os.E.NOTSOCK => error.FileDescriptorNotASocket,
+                        os.E.OPNOTSUPP => error.OperationNotSupported,
+                        os.E.PIPE => error.BrokenPipe,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else @intCast(usize, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
                 .timeout => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.ECANCELED => error.Canceled,
-                        os.ETIME => {}, // A success.
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.CANCELED => error.Canceled,
+                        os.E.TIME => {}, // A success.
+                        else => |errno| os.unexpectedErrno(errno),
                     } else unreachable;
                     completion.callback(completion.context, completion, &result);
                 },
-                .timeout_remove => |*op| {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                .timeout_remove => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.ECANCELED => error.Canceled,
-                        os.EBUSY => error.AlreadyInProgress,
-                        os.ENOENT => error.NotFound,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.CANCELED => error.Canceled,
+                        os.E.BUSY => error.AlreadyInProgress,
+                        os.E.NOENT => error.NotFound,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else assert(completion.result == 0);
                     completion.callback(completion.context, completion, &result);
                 },
                 .write => {
-                    const result = if (completion.result < 0) switch (-completion.result) {
-                        os.EINTR => {
+                    const result = if (completion.result < 0) switch (completion.err()) {
+                        os.E.INTR => {
                             completion.io.enqueue(completion);
                             return;
                         },
-                        os.EAGAIN => error.WouldBlock,
-                        os.EBADF => error.NotOpenForWriting,
-                        os.ECANCELED => error.Canceled,
-                        os.EDESTADDRREQ => error.NotConnected,
-                        os.EDQUOT => error.DiskQuota,
-                        os.EFAULT => unreachable,
-                        os.EFBIG => error.FileTooBig,
-                        os.EINVAL => error.Alignment,
-                        os.EIO => error.InputOutput,
-                        os.ENOSPC => error.NoSpaceLeft,
-                        os.ENXIO => error.Unseekable,
-                        os.EOVERFLOW => error.Unseekable,
-                        os.EPERM => error.AccessDenied,
-                        os.EPIPE => error.BrokenPipe,
-                        os.ESPIPE => error.Unseekable,
-                        else => |errno| os.unexpectedErrno(@intCast(usize, errno)),
+                        os.E.AGAIN => error.Again,
+                        os.E.BADF => error.NotOpenForWriting,
+                        os.E.CANCELED => error.Canceled,
+                        os.E.DESTADDRREQ => error.NotConnected,
+                        os.E.DQUOT => error.DiskQuota,
+                        os.E.FAULT => unreachable,
+                        os.E.FBIG => error.FileTooBig,
+                        os.E.INVAL => error.Alignment,
+                        os.E.IO => error.InputOutput,
+                        os.E.NOSPC => error.NoSpaceLeft,
+                        os.E.NXIO => error.Unseekable,
+                        os.E.OVERFLOW => error.Unseekable,
+                        os.E.PERM => error.AccessDenied,
+                        os.E.PIPE => error.BrokenPipe,
+                        os.E.SPIPE => error.Unseekable,
+                        else => |errno| os.unexpectedErrno(errno),
                     } else @intCast(usize, completion.result);
                     completion.callback(completion.context, completion, &result);
                 },
@@ -602,7 +612,7 @@ const IO_Linux = struct {
             flags: u32,
         },
         link_timeout: struct {
-            timespec: os.__kernel_timespec,
+            timespec: os.timespec,
         },
         openat: struct {
             fd: os.fd_t,
@@ -636,7 +646,7 @@ const IO_Linux = struct {
             flags: u32,
         },
         timeout: struct {
-            timespec: os.__kernel_timespec,
+            timespec: os.timespec,
         },
         timeout_remove: struct {
             timeout_completion: *Completion,
@@ -649,7 +659,7 @@ const IO_Linux = struct {
     };
 
     pub const AcceptError = error{
-        WouldBlock,
+        Again,
         FileDescriptorInvalid,
         ConnectionAborted,
         SocketNotListening,
@@ -818,7 +828,7 @@ const IO_Linux = struct {
         AddressInUse,
         AddressNotAvailable,
         AddressFamilyNotSupported,
-        WouldBlock,
+        Again,
         OpenAlreadyInProgress,
         FileDescriptorInvalid,
         ConnectionRefused,
@@ -1002,7 +1012,7 @@ const IO_Linux = struct {
         NoSpaceLeft,
         NotDir,
         FileLocksNotSupported,
-        WouldBlock,
+        Again,
         Canceled,
     } || os.UnexpectedError;
 
@@ -1046,7 +1056,7 @@ const IO_Linux = struct {
     }
 
     pub const ReadError = error{
-        WouldBlock,
+        Again,
         NotOpenForReading,
         ConnectionResetByPeer,
         Alignment,
@@ -1095,7 +1105,7 @@ const IO_Linux = struct {
     }
 
     pub const RecvError = error{
-        WouldBlock,
+        Again,
         FileDescriptorInvalid,
         ConnectionRefused,
         SystemResources,
@@ -1326,7 +1336,7 @@ const IO_Linux = struct {
 
     pub const SendError = error{
         AccessDenied,
-        WouldBlock,
+        Again,
         FastOpenAlreadyInProgress,
         AddressFamilyNotSupported,
         FileDescriptorInvalid,
@@ -1594,7 +1604,7 @@ const IO_Linux = struct {
     }
 
     pub const WriteError = error{
-        WouldBlock,
+        Again,
         NotOpenForWriting,
         NotConnected,
         DiskQuota,
@@ -1652,7 +1662,7 @@ pub fn buffer_limit(buffer_len: usize) usize {
     // stuffing the errno codes into the last `4096` values.
     // Darwin limits writes to `0x7fffffff` bytes, more than that returns `EINVAL`.
     // The corresponding POSIX limit is `std.math.maxInt(isize)`.
-    const limit = switch (std.Target.current.os.tag) {
+    const limit = switch (builtin.target.os.tag) {
         .linux => 0x7ffff000,
         .macos, .ios, .watchos, .tvos => std.math.maxInt(i32),
         else => std.math.maxInt(isize),
@@ -1758,6 +1768,7 @@ test "write/fsync/read" {
             completion: *IO.Completion,
             result: IO.ReadError!usize,
         ) void {
+            _ = completion;
             self.read = result catch @panic("read error");
             self.done = true;
         }
@@ -1811,6 +1822,7 @@ test "openat/close" {
             completion: *IO.Completion,
             result: IO.CloseError!void,
         ) void {
+            _ = completion;
             result catch @panic("close error");
             self.done = true;
         }
@@ -1895,7 +1907,7 @@ test "accept/connect/send/receive" {
                 completion,
                 self.client,
                 &self.send_buf,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
             );
         }
 
@@ -1904,6 +1916,7 @@ test "accept/connect/send/receive" {
             completion: *IO.Completion,
             result: IO.SendError!usize,
         ) void {
+            _ = completion;
             self.sent = result catch @panic("send error");
         }
 
@@ -1920,7 +1933,7 @@ test "accept/connect/send/receive" {
                 completion,
                 self.accepted_sock,
                 &self.recv_buf,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
             );
         }
 
@@ -1929,6 +1942,7 @@ test "accept/connect/send/receive" {
             completion: *IO.Completion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.received = result catch @panic("recv error");
             self.done = true;
         }
@@ -2047,7 +2061,7 @@ test "accept/connect/sendmsg/recvmsg" {
                 completion,
                 self.client,
                 &self.send_msg.?,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
             );
         }
 
@@ -2056,6 +2070,7 @@ test "accept/connect/sendmsg/recvmsg" {
             completion: *IO.Completion,
             result: IO.SendError!usize,
         ) void {
+            _ = completion;
             self.sent = result catch @panic("send error");
         }
 
@@ -2072,7 +2087,7 @@ test "accept/connect/sendmsg/recvmsg" {
                 completion,
                 self.accepted_sock,
                 &self.recv_msg.?,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
             );
         }
 
@@ -2081,6 +2096,7 @@ test "accept/connect/sendmsg/recvmsg" {
             completion: *IO.Completion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.received = result catch @panic("recv error");
             self.done = true;
         }
@@ -2200,7 +2216,7 @@ test "accept/connect/sendmsgWithTimeout/recvmsgWithTimeout" {
                 completion,
                 self.client,
                 &self.send_msg.?,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
                 5 * std.time.ns_per_s,
             );
         }
@@ -2210,6 +2226,7 @@ test "accept/connect/sendmsgWithTimeout/recvmsgWithTimeout" {
             completion: *IO.LinkedCompletion,
             result: IO.SendError!usize,
         ) void {
+            _ = completion;
             self.sent = result catch @panic("send error");
         }
 
@@ -2227,7 +2244,7 @@ test "accept/connect/sendmsgWithTimeout/recvmsgWithTimeout" {
                 comp,
                 self.accepted_sock,
                 &self.recv_msg.?,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
                 5 * std.time.ns_per_s,
             );
         }
@@ -2237,6 +2254,7 @@ test "accept/connect/sendmsgWithTimeout/recvmsgWithTimeout" {
             completion: *IO.LinkedCompletion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.received = result catch @panic("recv error");
             self.done = true;
         }
@@ -2317,7 +2335,7 @@ test "accept/connect/receive/cancel" {
                 completion,
                 self.client,
                 &self.recv_buf,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
             );
             self.io.cancel(
                 *Context,
@@ -2333,6 +2351,7 @@ test "accept/connect/receive/cancel" {
             completion: *IO.Completion,
             result: IO.AcceptError!os.socket_t,
         ) void {
+            _ = completion;
             self.accepted_sock = result catch @panic("accept error");
         }
 
@@ -2341,6 +2360,7 @@ test "accept/connect/receive/cancel" {
             completion: *IO.Completion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.recv_result = result;
         }
 
@@ -2349,6 +2369,7 @@ test "accept/connect/receive/cancel" {
             completion: *IO.Completion,
             result: IO.CancelError!void,
         ) void {
+            _ = completion;
             result catch @panic("cancel error");
             self.done = true;
         }
@@ -2438,7 +2459,7 @@ test "accept/connect/send/recvWithTimeout" {
                 completion,
                 self.client,
                 &self.send_buf,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
             );
         }
 
@@ -2447,6 +2468,7 @@ test "accept/connect/send/recvWithTimeout" {
             completion: *IO.Completion,
             result: IO.SendError!usize,
         ) void {
+            _ = completion;
             self.sent = result catch @panic("send error");
         }
 
@@ -2455,6 +2477,7 @@ test "accept/connect/send/recvWithTimeout" {
             completion: *IO.Completion,
             result: IO.AcceptError!os.socket_t,
         ) void {
+            _ = completion;
             self.accepted_sock = result catch @panic("accept error");
             self.io.recvWithTimeout(
                 *Context,
@@ -2463,7 +2486,7 @@ test "accept/connect/send/recvWithTimeout" {
                 &self.linked_completion,
                 self.accepted_sock,
                 &self.recv_buf,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
                 std.time.ns_per_ms,
             );
         }
@@ -2473,6 +2496,7 @@ test "accept/connect/send/recvWithTimeout" {
             completion: *IO.LinkedCompletion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.received = result catch @panic("recv error");
             self.done = true;
         }
@@ -2550,6 +2574,7 @@ test "accept/connect/recvWithTimeout" {
             completion: *IO.Completion,
             result: IO.ConnectError!void,
         ) void {
+            _ = completion;
             result catch @panic("connect error");
             self.io.recvWithTimeout(
                 *Context,
@@ -2558,7 +2583,7 @@ test "accept/connect/recvWithTimeout" {
                 &self.linked_completion,
                 self.client,
                 &self.recv_buf,
-                if (std.Target.current.os.tag == .linux) os.MSG_NOSIGNAL else 0,
+                if (builtin.target.os.tag == .linux) os.MSG_NOSIGNAL else 0,
                 std.time.ns_per_ms,
             );
         }
@@ -2568,6 +2593,7 @@ test "accept/connect/recvWithTimeout" {
             completion: *IO.Completion,
             result: IO.AcceptError!os.socket_t,
         ) void {
+            _ = completion;
             self.accepted_sock = result catch @panic("accept error");
         }
 
@@ -2576,6 +2602,7 @@ test "accept/connect/recvWithTimeout" {
             completion: *IO.LinkedCompletion,
             result: IO.RecvError!usize,
         ) void {
+            _ = completion;
             self.recv_result = result;
             self.done = true;
         }
@@ -2628,6 +2655,7 @@ test "timeout" {
             completion: *IO.Completion,
             result: IO.TimeoutError!void,
         ) void {
+            _ = completion;
             result catch @panic("timeout error");
             if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
             self.count += 1;
@@ -2690,6 +2718,7 @@ test "cancel timeout" {
             completion: *IO.Completion,
             result: IO.TimeoutError!void,
         ) void {
+            _ = completion;
             testing.expectError(error.Canceled, result) catch @panic("cancel timeout unexpected error");
             if (self.stop_time == 0) self.stop_time = std.time.milliTimestamp();
             self.count += 1;
@@ -2700,6 +2729,7 @@ test "cancel timeout" {
             completion: *IO.Completion,
             result: IO.CancelTimeoutError!void,
         ) void {
+            _ = completion;
             result catch |err| @panic(@errorName(err));
             self.cancel_count += 1;
         }
@@ -2743,6 +2773,7 @@ test "submission queue full" {
             completion: *IO.Completion,
             result: IO.TimeoutError!void,
         ) void {
+            _ = completion;
             result catch @panic("timeout error");
             self.count += 1;
         }

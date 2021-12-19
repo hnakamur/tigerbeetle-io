@@ -13,11 +13,11 @@ const Client = struct {
     recv_timeout_ns: u63,
     send_buf: []u8,
     recv_buf: []u8,
-    allocator: *mem.Allocator,
+    allocator: mem.Allocator,
     completions: [2]IO.Completion = undefined,
     done: bool = false,
 
-    fn init(allocator: *mem.Allocator, address: std.net.Address, recv_timeout_ns: u63) !Client {
+    fn init(allocator: mem.Allocator, address: std.net.Address, recv_timeout_ns: u63) !Client {
         const sock = try os.socket(address.any.family, os.SOCK_STREAM | os.SOCK_CLOEXEC, 0);
         const send_buf = try allocator.alloc(u8, 8192);
         const recv_buf = try allocator.alloc(u8, 8192);
