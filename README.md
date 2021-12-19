@@ -10,7 +10,7 @@ An IO event loop extracted from [TigerBeetle](https://github.com/coilhq/tigerbee
         - These are using [io_uring linked timeouts](https://lwn.net/Articles/803932/) and more efficient than using normal timeouts and manual cancellations.
     - cancel
     - cancelTimeout
-- target Zig version: 0.8.1
+- target Zig version: 0.9.0
 
 I wrote [a blog post](https://dev.to/hnakamur/experimenting-timeout-and-cancellation-with-zig-asyncawait-and-tigerbeetle-io-53o5) about this. (also backup at [blog.md](blog.md)).
 
