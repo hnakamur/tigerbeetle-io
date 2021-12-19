@@ -13,7 +13,7 @@ pub const IO = struct {
     completed: FIFO(Completion) = .{},
     io_pending: FIFO(Completion) = .{},
 
-    pub fn init(entries: u12, flags: u32) !IO {
+    pub fn init(_: u12, _: u32) !IO {
         const kq = try os.kqueue();
         assert(kq > -1);
         return IO{ .kq = kq };
@@ -41,8 +41,8 @@ pub const IO = struct {
         const on_timeout = struct {
             fn callback(
                 timed_out_ptr: *bool,
-                _completion: *Completion,
-                _result: TimeoutError!void,
+                _: *Completion,
+                _: TimeoutError!void,
             ) void {
                 timed_out_ptr.* = true;
             }
@@ -117,7 +117,7 @@ pub const IO = struct {
         }
     }
 
-    fn flush_io(self: *IO, events: []os.Kevent, io_pending_top: *?*Completion) usize {
+    fn flush_io(_: *IO, events: []os.Kevent, io_pending_top: *?*Completion) usize {
         for (events) |*event, flushed| {
             const completion = io_pending_top.* orelse return flushed;
             io_pending_top.* = completion.next;
