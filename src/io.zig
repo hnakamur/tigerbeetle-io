@@ -79,9 +79,9 @@ const IO_Linux = struct {
         // timeout below as an absolute value. Otherwise, we may deadlock if the clock sources are
         // dramatically different. Any kernel that supports io_uring will support CLOCK_MONOTONIC.
         var current_ts: os.timespec = undefined;
-        os.clock_gettime(os.CLOCK_MONOTONIC, &current_ts) catch unreachable;
+        os.clock_gettime(os.CLOCK.MONOTONIC, &current_ts) catch unreachable;
         // The absolute CLOCK_MONOTONIC time after which we may return from this function:
-        const timeout_ts: os.__kernel_timespec = .{
+        const timeout_ts: os.linux.kernel_timespec = .{
             .tv_sec = current_ts.tv_sec,
             .tv_nsec = current_ts.tv_nsec + nanoseconds,
         };
@@ -94,7 +94,7 @@ const IO_Linux = struct {
                 break :blk self.ring.get_sqe() catch unreachable;
             };
             // Submit an absolute timeout that will be canceled if any other SQE completes first:
-            linux.io_uring_prep_timeout(timeout_sqe, &timeout_ts, 1, os.IORING_TIMEOUT_ABS);
+            linux.io_uring_prep_timeout(timeout_sqe, &timeout_ts, 1, os.linux.IORING_TIMEOUT_ABS);
             timeout_sqe.user_data = 0;
             timeouts += 1;
             // The amount of time this call will block is bounded by the timeout we just submitted:
